@@ -1,6 +1,6 @@
 cc = 's390x-linux-gnu-gcc'
+cc_alt = ['s390x-redhat-linux-gcc']
 cc_dockerfile = 'debian-all-test-cross'
-cc_docker_host_arch = ['aarch64', 'x86_64']
 
 cc_feat_cflags = {
   'z14': '-march=z14',
@@ -74,6 +74,17 @@ tests += {
   'ts.c': {},
   'ex-smc.c': {'cflags': ['-Wl,--no-warn-rwx-segments']},
   'load-store-reversed.c': {},
+  'cpacf-kdsa.c': {},
+  'cpacf-kimd.c': {},
+  'cpacf-klmd.c': {},
+  'cpacf-km.c': {},
+  'cpacf-kmac.c': {},
+  'cpacf-kmc.c': {},
+  'cpacf-kmctr.c': {},
+  'cpacf-pcc.c': {},
+  'cpacf-pckmo.c': {},
+  'cpacf-prno.c': {},
+  'issue4449.c': {},
 }
 
 foreach src: tests_s390x_pgm
@@ -130,8 +141,8 @@ if 'qemu-s390x' in emulators
   tcg_tests += {
     's390x-linux-user': {
       'cc': cc,
+      'cc_alt': cc_alt,
       'cc_dockerfile': cc_dockerfile,
-      'cc_docker_host_arch': cc_docker_host_arch,
       'cc_feat_cflags': cc_feat_cflags,
       'folder': 's390x',
       'gdb_arch': 's390x',

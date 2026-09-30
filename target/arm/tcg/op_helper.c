@@ -398,7 +398,7 @@ void HELPER(wfi)(CPUARMState *env, uint32_t insn_len)
                         target_el);
     }
 
-    env->halt_reason = HALT_WFI;
+    qatomic_set(&env->halt_reason, HALT_WFI);
     cs->exception_index = EXCP_HLT;
     cs->halted = 1;
     cpu_loop_exit(cs);
@@ -448,7 +448,8 @@ void HELPER(wfit)(CPUARMState *env, uint32_t rd)
         raise_exception(env, excp, syn_wfx(1, 0xe, rd, true, WFIT, false), target_el);
     }
 
-    if (uadd64_overflow(timeout, offset, &nexttick)) {
+    /* Physical count at the timeout. Only an overflow of it is "never". */
+    if (uadd64_overflow(cntval, timeout - cntvct, &nexttick)) {
         nexttick = UINT64_MAX;
     }
     if (nexttick > INT64_MAX / gt_cntfrq_period_ns(cpu)) {
@@ -460,7 +461,7 @@ void HELPER(wfit)(CPUARMState *env, uint32_t rd)
     } else {
         timer_mod(cpu->wfxt_timer, nexttick);
     }
-    env->halt_reason = HALT_WFI;
+    qatomic_set(&env->halt_reason, HALT_WFI);
     cs->exception_index = EXCP_HLT;
     cs->halted = 1;
     cpu_loop_exit(cs);
@@ -629,7 +630,7 @@ void HELPER(wfe)(CPUARMState *env, uint32_t insn_len)
         }
     }
 
-    env->halt_reason = HALT_WFE;
+    qatomic_set(&env->halt_reason, HALT_WFE);
     cs->exception_index = EXCP_HLT;
     cs->halted = 1;
     cpu_loop_exit(cs);
@@ -705,7 +706,8 @@ void HELPER(wfet)(CPUARMState *env, uint32_t rd)
      * The WFET should time out when CNTVCT_EL0 >= the specified value.
      */
     cpu = env_archcpu(env);
-    if (uadd64_overflow(timeout, offset, &nexttick)) {
+    /* Physical count at the timeout. Only an overflow of it is "never". */
+    if (uadd64_overflow(cntval, timeout - cntvct, &nexttick)) {
         nexttick = UINT64_MAX;
     }
     if (nexttick > INT64_MAX / gt_cntfrq_period_ns(cpu)) {
@@ -723,7 +725,7 @@ void HELPER(wfet)(CPUARMState *env, uint32_t rd)
         }
     }
 
-    env->halt_reason = HALT_WFE;
+    qatomic_set(&env->halt_reason, HALT_WFE);
     cs->exception_index = EXCP_HLT;
     cs->halted = 1;
     cpu_loop_exit(cs);
