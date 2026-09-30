@@ -58,6 +58,7 @@ confidence=HIGH,
 # no Warning level messages displayed, use "--disable=all --enable=classes
 # --disable=W".
 disable=bad-inline-option,
+        c-extension-no-member,
         consider-using-f-string,
         file-ignored,
         fixme,
@@ -76,6 +77,12 @@ disable=bad-inline-option,
         use-implicit-booleaness-not-comparison-to-zero,
         use-symbolic-message-instead,
         useless-suppression,
+
+
+[TYPECHECK]
+
+# cv2 is a C extension module whose members are not visible to pylint
+generated-members=cv2.*
 
 
 [SIMILARITIES]

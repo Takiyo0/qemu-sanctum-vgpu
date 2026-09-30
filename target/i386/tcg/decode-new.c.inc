@@ -603,23 +603,33 @@ static void decode_0F77(DisasContext *s, CPUX86State *env, X86OpEntry *entry, ui
 
 static void decode_0F78(DisasContext *s, CPUX86State *env, X86OpEntry *entry, uint8_t *b)
 {
-    static const X86OpEntry opcodes_0F78[4] = {
-        {},
-        X86_OP_ENTRY3(EXTRQ_i,       V,x, None,None, I,w,  cpuid(SSE4A)), /* AMD extension */
-        {},
-        X86_OP_ENTRY3(INSERTQ_i,     V,x, U,x, I,w,        cpuid(SSE4A)), /* AMD extension */
-    };
-    *entry = *decode_by_prefix(s, opcodes_0F78);
+    static const X86OpEntry opcodes_0F78_f2 =
+        X86_OP_ENTRY3(INSERTQ_i,     V,x, U,x, I,w,        cpuid(SSE4A)); /* AMD extension */
+    static const X86OpEntry opcodes_0F78_66 =
+        X86_OP_ENTRY3(EXTRQ_i,       U,x, None,None, I,w,  cpuid(SSE4A)); /* AMD extension */
+
+    entry->gen = NULL;
+    if (s->prefix & PREFIX_REPNZ) {
+        *entry = opcodes_0F78_f2;
+    } else if (s->prefix & PREFIX_REPZ) {
+        /* undefined */
+    } else if (s->prefix & PREFIX_DATA) {
+        int op = (get_modrm(s, env) >> 3) & 7;
+        if (op == 0) {
+            *entry = opcodes_0F78_66;
+        }
+    }
 }
 
 static void decode_0F79(DisasContext *s, CPUX86State *env, X86OpEntry *entry, uint8_t *b)
 {
+    entry->gen = NULL;
     if (s->prefix & PREFIX_REPNZ) {
         entry->gen = gen_INSERTQ_r; /* AMD extension */
+    } else if (s->prefix & PREFIX_REPZ) {
+        /* undefined */
     } else if (s->prefix & PREFIX_DATA) {
         entry->gen = gen_EXTRQ_r; /* AMD extension */
-    } else {
-        entry->gen = NULL;
     };
 }
 
@@ -1364,7 +1374,7 @@ static const X86OpEntry opcodes_0F[256] = {
     [0xc0] = X86_OP_ENTRY2(XADD,       E,b, G,b,            lock),
     [0xc1] = X86_OP_ENTRY2(XADD,       E,v, G,v,            lock),
     [0xc2] = X86_OP_ENTRY4(VCMP,       V,x, H,x, W,x,       vex2_rep3 p_00_66_f3_f2),
-    [0xc3] = X86_OP_ENTRY3(MOV,        EM,y,G,y, None,None, cpuid(SSE2)), /* MOVNTI */
+    [0xc3] = X86_OP_ENTRY3(MOV,        EM,y,G,y, None,None, cpuid(SSE2) p_00), /* MOVNTI */
     [0xc4] = X86_OP_ENTRY4(PINSRW,     V,dq,H,dq,E,w,       vex5 mmx p_00_66),
     [0xc5] = X86_OP_ENTRY3(PEXTRW,     G,d, U,dq,I,b,       vex5 mmx p_00_66),
     [0xc6] = X86_OP_ENTRY4(VSHUF,      V,x, H,x, W,x,       vex4 p_00_66),
@@ -1614,6 +1624,7 @@ static void decode_group3(DisasContext *s, CPUX86State *env, X86OpEntry *entry, 
     static const X86OpEntry opcodes_grp3[16] = {
         /* 0xf6 */
         [0x00] = X86_OP_ENTRYrr(AND, E,b, I,b),
+        [0x01] = X86_OP_ENTRYrr(AND, E,b, I,b),
         [0x02] = X86_OP_ENTRY1(NOT,  E,b,      lock),
         [0x03] = X86_OP_ENTRY1(NEG,  E,b,      lock),
         [0x04] = X86_OP_ENTRYrr(MUL, E,b, 0,b, zextT0),
@@ -1623,6 +1634,7 @@ static void decode_group3(DisasContext *s, CPUX86State *env, X86OpEntry *entry, 
 
         /* 0xf7 */
         [0x08] = X86_OP_ENTRYrr(AND, E,v, I,z),
+        [0x09] = X86_OP_ENTRYrr(AND, E,v, I,z),
         [0x0a] = X86_OP_ENTRY1(NOT,  E,v,      lock),
         [0x0b] = X86_OP_ENTRY1(NEG,  E,v,      lock),
         [0x0c] = X86_OP_ENTRYrr(MUL, E,v, 0,v, zextT0),
@@ -2000,9 +2012,8 @@ static void decode_root(DisasContext *s, CPUX86State *env, X86OpEntry *entry, ui
 static void decode_modrm(DisasContext *s, CPUX86State *env,
                          X86DecodedInsn *decode, X86DecodedOp *op)
 {
-    int modrm = get_modrm(s, env);
-    int mod = (modrm >> 6) & 3;
-    int rm = modrm & 7;
+    int mod = (s->modrm >> 6) & 3;
+    int rm = s->modrm & 7;
     bool is_vsib = decode->e.vex_class == 12;
     int sib = -1;
 
@@ -2214,11 +2225,33 @@ static bool decode_op_size(DisasContext *s, X86OpEntry *e, X86OpSize size, MemOp
     }
 }
 
+static bool op_has_modrm(X86OpType type)
+{
+    switch (type) {
+    case X86_TYPE_C:  /* REG in the modrm byte selects a control register */
+    case X86_TYPE_D:  /* REG in the modrm byte selects a debug register */
+    case X86_TYPE_E:  /* ALU modrm operand */
+    case X86_TYPE_EM:  /* modrm byte selects an ALU memory operand */
+    case X86_TYPE_G:  /* REG in the modrm byte selects a GPR */
+    case X86_TYPE_M:  /* modrm byte selects a memory operand */
+    case X86_TYPE_nop:  /* modrm operand decoded but not fetched */
+    case X86_TYPE_N:  /* R/M in the modrm byte selects an MMX register */
+    case X86_TYPE_P:  /* REG in the modrm byte selects an MMX register */
+    case X86_TYPE_Q:  /* MMX modrm operand */
+    case X86_TYPE_R:  /* R/M in the modrm byte selects a register */
+    case X86_TYPE_U:  /* R/M in the modrm byte selects an XMM/YMM register */
+    case X86_TYPE_V:  /* reg in the modrm byte selects an XMM/YMM register */
+    case X86_TYPE_WM:  /* modrm byte selects an XMM/YMM memory operand */
+    case X86_TYPE_W:  /* XMM/YMM modrm operand */
+        return true;
+    default:
+        return false;
+    }
+}
+
 static bool decode_op(DisasContext *s, CPUX86State *env, X86DecodedInsn *decode,
                       X86DecodedOp *op, X86OpType type, int b)
 {
-    int modrm;
-
     switch (type) {
     case X86_TYPE_None:  /* Implicit or absent */
     case X86_TYPE_A:  /* Implicit */
@@ -2234,7 +2267,7 @@ static bool decode_op(DisasContext *s, CPUX86State *env, X86DecodedInsn *decode,
 
     case X86_TYPE_C:  /* REG in the modrm byte selects a control register */
         op->unit = X86_OP_CR;
-        op->n = ((get_modrm(s, env) >> 3) & 7) | REX_R(s);
+        op->n = ((s->modrm >> 3) & 7) | REX_R(s);
         if (op->n == 0 && (s->prefix & PREFIX_LOCK) &&
             (s->cpuid_ext3_features & CPUID_EXT3_CR8LEG)) {
             op->n = 8;
@@ -2250,7 +2283,7 @@ static bool decode_op(DisasContext *s, CPUX86State *env, X86DecodedInsn *decode,
 
     case X86_TYPE_D:  /* REG in the modrm byte selects a debug register */
         op->unit = X86_OP_DR;
-        op->n = ((get_modrm(s, env) >> 3) & 7) | REX_R(s);
+        op->n = ((s->modrm >> 3) & 7) | REX_R(s);
         if (op->n >= 8) {
             /*
              * illegal opcode.  The DR4 and DR5 case is checked in the generated
@@ -2269,14 +2302,14 @@ static bool decode_op(DisasContext *s, CPUX86State *env, X86DecodedInsn *decode,
 
     case X86_TYPE_S:  /* reg selects a segment register */
         op->unit = X86_OP_SEG;
-        op->n = (get_modrm(s, env) >> 3) & 7;
+        op->n = (s->modrm >> 3) & 7;
         /* Values outside [CDEFGS]S, as well as storing to CS, are invalid.  */
         if (op->n >= 6 || (op->n == R_CS && op == &decode->op[0])) {
             return false;
         }
         break;
 
-    case X86_TYPE_P:
+    case X86_TYPE_P:  /* REG in the modrm byte selects an MMX register */
         op->unit = X86_OP_MMX;
         goto get_reg;
 
@@ -2288,7 +2321,7 @@ static bool decode_op(DisasContext *s, CPUX86State *env, X86DecodedInsn *decode,
             op->unit = X86_OP_SSE;
         }
     get_reg:
-        op->n = ((get_modrm(s, env) >> 3) & 7);
+        op->n = ((s->modrm >> 3) & 7);
         if (op->unit != X86_OP_MMX) {
             op->n |= REX_R(s);
         }
@@ -2327,8 +2360,7 @@ static bool decode_op(DisasContext *s, CPUX86State *env, X86DecodedInsn *decode,
     case X86_TYPE_R:  /* R/M in the modrm byte selects a register */
         op->unit = X86_OP_INT;
     get_modrm_reg:
-        modrm = get_modrm(s, env);
-        if ((modrm >> 6) != 3) {
+        if ((s->modrm >> 6) != 3) {
             return false;
         }
         goto get_modrm;
@@ -2342,8 +2374,7 @@ static bool decode_op(DisasContext *s, CPUX86State *env, X86DecodedInsn *decode,
         /* fall through */
     case X86_TYPE_M:  /* modrm byte selects a memory operand */
     get_modrm_mem:
-        modrm = get_modrm(s, env);
-        if ((modrm >> 6) == 3) {
+        if ((s->modrm >> 6) == 3) {
             return false;
         }
         /* fall through */
@@ -2451,7 +2482,7 @@ static bool decode_insn(DisasContext *s, CPUX86State *env, X86DecodeFunc decode_
         return false;
     }
 
-    /* First compute size of operands in order to initialize s->rip_offset.  */
+    /* Compute size of operands here in order to initialize s->rip_offset.  */
     if (e->op0 != X86_TYPE_None) {
         if (!decode_op_size(s, e, e->s0, &decode->op[0].ot)) {
             return false;
@@ -2484,6 +2515,13 @@ static bool decode_insn(DisasContext *s, CPUX86State *env, X86DecodeFunc decode_
         assert(e->op3 == X86_TYPE_I && e->s3 == X86_SIZE_b);
         s->rip_offset += 1;
     }
+    return true;
+}
+
+static bool decode_ops(DisasContext *s, CPUX86State *env, X86DecodeFunc decode_func,
+                       X86DecodedInsn *decode)
+{
+    X86OpEntry *e = &decode->e;
 
     if (e->op0 != X86_TYPE_None &&
         !decode_op(s, env, decode, &decode->op[0], e->op0, decode->b)) {
@@ -2502,6 +2540,22 @@ static bool decode_insn(DisasContext *s, CPUX86State *env, X86DecodeFunc decode_
 
     if (e->op3 != X86_TYPE_None) {
         decode->immediate = insn_get_signed(env, s, MO_8);
+    }
+
+    if (e->vex_class == 12) {
+        /* Check no overlap between registers.  */
+        if (!decode->op[0].has_ea &&
+            (decode->op[0].n == decode->mem.index || decode->op[0].n == decode->op[1].n)) {
+            return false;
+        }
+        assert(!decode->op[1].has_ea);
+        if (decode->op[1].n == decode->mem.index) {
+            return false;
+        }
+        if (!decode->op[2].has_ea &&
+            (decode->op[2].n == decode->mem.index || decode->op[2].n == decode->op[1].n)) {
+            return false;
+        }
     }
 
     return true;
@@ -2610,9 +2664,9 @@ static bool validate_vex(DisasContext *s, X86DecodedInsn *decode)
             if (s->vex_l) {
                 goto illegal;
             }
-            assert(decode->e.s2 == X86_SIZE_x);
-            if (decode->op[2].has_ea) {
-                decode->op[2].ot = s->prefix & PREFIX_REPZ ? MO_32 : MO_64;
+            assert(e->op2 == X86_TYPE_W && e->s2 == X86_SIZE_x);
+            if ((s->modrm >> 6) != 3) {
+                e->s2 = s->prefix & PREFIX_REPNZ ? X86_SIZE_sd : X86_SIZE_ss;
             }
         }
         break;
@@ -2629,10 +2683,7 @@ static bool validate_vex(DisasContext *s, X86DecodedInsn *decode)
 
     switch (e->vex_class) {
     case 0:
-        if (s->prefix & PREFIX_VEX) {
-            goto illegal;
-        }
-        return true;
+        g_assert_not_reached();
     case 1:
     case 2:
     case 3:
@@ -2657,19 +2708,6 @@ static bool validate_vex(DisasContext *s, X86DecodedInsn *decode)
             goto illegal;
         }
 
-        /* Check no overlap between registers.  */
-        if (!decode->op[0].has_ea &&
-            (decode->op[0].n == decode->mem.index || decode->op[0].n == decode->op[1].n)) {
-            goto illegal;
-        }
-        assert(!decode->op[1].has_ea);
-        if (decode->op[1].n == decode->mem.index) {
-            goto illegal;
-        }
-        if (!decode->op[2].has_ea &&
-            (decode->op[2].n == decode->mem.index || decode->op[2].n == decode->op[1].n)) {
-            goto illegal;
-        }
         /* fall through */
     case 6:
     case 11:
@@ -2710,24 +2748,6 @@ static bool validate_vex(DisasContext *s, X86DecodedInsn *decode)
     }
     if (s->flags & HF_EM_MASK) {
         goto illegal;
-    }
-
-    if (e->check) {
-        if (e->check & X86_CHECK_VEX128) {
-            if (s->vex_l) {
-                goto illegal;
-            }
-        }
-        if (e->check & X86_CHECK_W0) {
-            if (s->vex_w) {
-                goto illegal;
-            }
-        }
-        if (e->check & X86_CHECK_W1) {
-            if (!s->vex_w) {
-                goto illegal;
-            }
-        }
     }
     return true;
 
@@ -2806,16 +2826,24 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
         s->prefix |= PREFIX_LOCK;
         goto next_byte;
     case 0x2e:
-        s->override = R_CS;
+        if (!CODE64(s)) {
+            s->override = R_CS;
+        }
         goto next_byte;
     case 0x36:
-        s->override = R_SS;
+        if (!CODE64(s)) {
+            s->override = R_SS;
+        }
         goto next_byte;
     case 0x3e:
-        s->override = R_DS;
+        if (!CODE64(s)) {
+            s->override = R_DS;
+        }
         goto next_byte;
     case 0x26:
-        s->override = R_ES;
+        if (!CODE64(s)) {
+            s->override = R_ES;
+        }
         goto next_byte;
     case 0x64:
         s->override = R_FS;
@@ -2980,6 +3008,34 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
                 goto illegal_op;
             }
         }
+        if ((decode.e.check & X86_CHECK_VEX128) && s->vex_l) {
+            goto illegal_op;
+        }
+        if ((decode.e.check & X86_CHECK_W0) && s->vex_w) {
+            goto illegal_op;
+        }
+        if ((decode.e.check & X86_CHECK_W1) && !s->vex_w) {
+            goto illegal_op;
+        }
+    }
+
+    if (op_has_modrm(decode.e.op0) || op_has_modrm(decode.e.op1) ||
+        op_has_modrm(decode.e.op2)) {
+        get_modrm(s, env);
+    }
+
+    if (decode.e.vex_class == 0) {
+        if (s->prefix & PREFIX_VEX) {
+            goto illegal_op;
+        }
+    } else {
+        if (!validate_vex(s, &decode)) {
+            return;
+        }
+    }
+
+    if (!decode_ops(s, env, decode_func, &decode)) {
+        goto illegal_op;
     }
 
     switch (decode.e.special) {
@@ -3037,10 +3093,6 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
 
     if ((s->prefix & PREFIX_LOCK) && !accept_lock) {
         goto illegal_op;
-    }
-
-    if (!validate_vex(s, &decode)) {
-        return;
     }
 
     /*

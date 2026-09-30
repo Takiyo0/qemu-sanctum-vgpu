@@ -9,7 +9,7 @@
 #include "ui/console.h"
 #include "ui/shader.h"
 
-extern EGLDisplay *qemu_egl_display;
+extern EGLDisplay qemu_egl_display;
 extern EGLConfig qemu_egl_config;
 extern DisplayGLMode qemu_egl_mode;
 extern bool qemu_egl_angle_d3d;
@@ -54,8 +54,8 @@ bool egl_dmabuf_export_texture(uint32_t tex_id, int *fd, EGLint *offset,
 
 void egl_dmabuf_import_texture(QemuDmaBuf *dmabuf);
 void egl_dmabuf_release_texture(QemuDmaBuf *dmabuf);
-void egl_dmabuf_create_sync(QemuDmaBuf *dmabuf);
-void egl_dmabuf_create_fence(QemuDmaBuf *dmabuf);
+EGLSyncKHR egl_create_sync(void);
+int egl_create_fence(EGLSyncKHR sync);
 
 #endif
 
@@ -81,6 +81,7 @@ EGLContext qemu_egl_init_ctx(void);
 bool qemu_egl_has_dmabuf(void);
 
 bool egl_init(const char *rendernode, DisplayGLMode mode, Error **errp);
+void egl_cleanup(void);
 
 const char *qemu_egl_get_error_string(void);
 

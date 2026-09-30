@@ -18,7 +18,7 @@
 #include "internal.h"
 #include "helper_protos_generated.h.inc"
 
-DEF_HELPER_FLAGS_2(raise_exception, TCG_CALL_NO_RETURN, noreturn, env, i32)
+DEF_HELPER_FLAGS_3(raise_exception, TCG_CALL_NO_RETURN, noreturn, env, i32, i32)
 DEF_HELPER_2(commit_store, void, env, int)
 DEF_HELPER_3(gather_store, void, env, i32, int)
 DEF_HELPER_1(commit_hvx_stores, void, env)
@@ -107,3 +107,38 @@ DEF_HELPER_4(probe_noshuf_load, void, env, i32, int, int)
 DEF_HELPER_2(probe_pkt_scalar_store_s0, void, env, int)
 DEF_HELPER_2(probe_hvx_stores, void, env, int)
 DEF_HELPER_2(probe_pkt_scalar_hvx_stores, void, env, int)
+
+DEF_HELPER_FLAGS_4(gvec_sabsdiff_h, TCG_CALL_NO_RWG, void, ptr, ptr, ptr, i32)
+DEF_HELPER_FLAGS_4(gvec_sabsdiff_w, TCG_CALL_NO_RWG, void, ptr, ptr, ptr, i32)
+DEF_HELPER_FLAGS_4(gvec_uabsdiff_b, TCG_CALL_NO_RWG, void, ptr, ptr, ptr, i32)
+DEF_HELPER_FLAGS_4(gvec_uabsdiff_h, TCG_CALL_NO_RWG, void, ptr, ptr, ptr, i32)
+
+#if defined(CONFIG_USER_ONLY)
+DEF_HELPER_FLAGS_0(utimer, TCG_CALL_NO_RWG, i64)
+DEF_HELPER_5(insn_cache_op, void, env, i32, int, int, i32)
+#endif
+
+#if !defined(CONFIG_USER_ONLY)
+DEF_HELPER_3(raise_stack_overflow, void, env, i32, i32)
+DEF_HELPER_2(swi, void, env, i32)
+DEF_HELPER_2(cswi, void, env, i32)
+DEF_HELPER_2(ciad, void, env, i32)
+DEF_HELPER_2(siad, void, env, i32)
+DEF_HELPER_2(iassignw, void, env, i32)
+DEF_HELPER_2(iassignr, i32, env, i32)
+DEF_HELPER_2(getimask, i32, env, i32)
+DEF_HELPER_3(setimask, void, env, i32, i32)
+DEF_HELPER_2(sreg_read, i32, env, i32)
+DEF_HELPER_2(sreg_read_pair, i64, env, i32)
+DEF_HELPER_2(greg_read, i32, env, i32)
+DEF_HELPER_2(greg_read_pair, i64, env, i32)
+DEF_HELPER_3(sreg_write_masked, void, env, i32, i32)
+DEF_HELPER_3(setprio, void, env, i32, i32)
+DEF_HELPER_2(start, void, env, i32)
+DEF_HELPER_1(stop, void, env)
+DEF_HELPER_2(wait, void, env, i32)
+DEF_HELPER_2(resume, void, env, i32)
+DEF_HELPER_1(resched, void, env)
+DEF_HELPER_3(modify_ssr, void, env, i32, i32)
+DEF_HELPER_1(pending_interrupt, void, env)
+#endif

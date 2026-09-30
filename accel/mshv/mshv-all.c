@@ -39,13 +39,11 @@
 #include "system/mshv.h"
 #include "system/mshv_int.h"
 #include "system/reset.h"
+#include "migration/qemu-file-types.h"
+#include "migration/register.h"
 #include "trace.h"
 #include <err.h>
 #include <sys/ioctl.h>
-
-#define TYPE_MSHV_ACCEL ACCEL_CLASS_NAME("mshv")
-
-DECLARE_INSTANCE_CHECKER(MshvState, MSHV_STATE, TYPE_MSHV_ACCEL)
 
 bool mshv_allowed;
 
@@ -62,48 +60,102 @@ static int init_mshv(int *mshv_fd)
     return 0;
 }
 
-/* freeze 1 to pause, 0 to resume */
-static int set_time_freeze(int vm_fd, int freeze)
+static int mshv_load_cleanup(void *opaque)
+{
+    CPUState *cpu;
+    int ret;
+
+    ret = mshv_arch_set_partition_msrs(first_cpu);
+    if (ret < 0) {
+        error_report("Failed to set partition MSRs: %s", strerror(-ret));
+        return -1;
+    }
+
+    CPU_FOREACH(cpu) {
+        ret = mshv_arch_set_mp_state(cpu);
+        if (ret < 0) {
+            error_report("Failed to set mp state for vCPU %d: %s",
+                         cpu->cpu_index, strerror(-ret));
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+
+static int get_host_partition_property(int mshv_fd, uint32_t property_code,
+                                       uint64_t *value)
 {
     int ret;
-    struct hv_input_set_partition_property in = {0};
-    in.property_code = HV_PARTITION_PROPERTY_TIME_FREEZE;
-    in.property_value = freeze;
-
+    struct hv_input_get_partition_property in = {0};
+    struct hv_output_get_partition_property out = {0};
     struct mshv_root_hvcall args = {0};
-    args.code = HVCALL_SET_PARTITION_PROPERTY;
-    args.in_sz = sizeof(in);
-    args.in_ptr = (uint64_t)&in;
 
-    ret = mshv_hvcall(vm_fd, &args);
+    in.property_code = property_code;
+
+    args.code    = HVCALL_GET_PARTITION_PROPERTY;
+    args.in_sz   = sizeof(in);
+    args.in_ptr  = (uint64_t)&in;
+    args.out_sz  = sizeof(out);
+    args.out_ptr = (uint64_t)&out;
+
+    ret = ioctl(mshv_fd, MSHV_ROOT_HVCALL, &args);
     if (ret < 0) {
-        error_report("Failed to set time freeze");
+        error_report("Failed to get host partition property bank: %s",
+                     strerror(errno));
         return -1;
     }
 
+    *value = out.property_value;
     return 0;
 }
 
-static int pause_vm(int vm_fd)
+static int get_partition_property(int vm_fd, uint32_t feature_bank,
+                                  uint64_t *value)
 {
+    struct hv_input_get_partition_property in = {0};
+    struct hv_output_get_partition_property out = {0};
+    struct mshv_root_hvcall args = {0};
     int ret;
 
-    ret = set_time_freeze(vm_fd, 1);
+    in.property_code = feature_bank;
+
+    args.code    = HVCALL_GET_PARTITION_PROPERTY;
+    args.in_sz   = sizeof(in);
+    args.in_ptr  = (uint64_t)&in;
+    args.out_sz  = sizeof(out);
+    args.out_ptr = (uint64_t)&out;
+
+    ret = ioctl(vm_fd, MSHV_ROOT_HVCALL, &args);
     if (ret < 0) {
-        error_report("Failed to pause partition: %s", strerror(errno));
+        error_report("Failed to get guest partition property bank: %s",
+                     strerror(errno));
         return -1;
     }
 
+    *value = out.property_value;
     return 0;
 }
 
-static int resume_vm(int vm_fd)
+static int get_proc_features(int vm_fd,
+                             union hv_partition_processor_features *features)
 {
     int ret;
 
-    ret = set_time_freeze(vm_fd, 0);
+    ret = get_partition_property(vm_fd,
+                                 HV_PARTITION_PROPERTY_PROCESSOR_FEATURES0,
+                                 &features->as_uint64[0]);
     if (ret < 0) {
-        error_report("Failed to resume partition: %s", strerror(errno));
+        error_report("Failed to get processor features bank 0");
+        return -1;
+    }
+
+    ret = get_partition_property(vm_fd,
+                                 HV_PARTITION_PROPERTY_PROCESSOR_FEATURES1,
+                                 &features->as_uint64[1]);
+    if (ret < 0) {
+        error_report("Failed to get processor features bank 1");
         return -1;
     }
 
@@ -113,18 +165,63 @@ static int resume_vm(int vm_fd)
 static int create_partition(int mshv_fd, int *vm_fd)
 {
     int ret;
-    struct mshv_create_partition args = {0};
+    uint64_t pt_flags, host_proc_features;
+    union hv_partition_processor_xsave_features disabled_xsave_features;
+    union hv_partition_processor_features disabled_partition_features = {0};
+
+    struct mshv_create_partition_v2 args = {0};
+
+    QEMU_BUILD_BUG_ON(MSHV_NUM_CPU_FEATURES_BANKS != 2);
 
     /* Initialize pt_flags with the desired features */
-    uint64_t pt_flags = (1ULL << MSHV_PT_BIT_LAPIC) |
-                        (1ULL << MSHV_PT_BIT_X2APIC) |
-                        (1ULL << MSHV_PT_BIT_GPA_SUPER_PAGES);
+    pt_flags = (1ULL << MSHV_PT_BIT_LAPIC) |
+               (1ULL << MSHV_PT_BIT_X2APIC) |
+               (1ULL << MSHV_PT_BIT_GPA_SUPER_PAGES) |
+               (1ULL << MSHV_PT_BIT_CPU_AND_XSAVE_FEATURES);
 
-    /* Set default isolation type */
-    uint64_t pt_isolation = MSHV_PT_ISOLATION_NONE;
+    /* enable all */
+    disabled_xsave_features.as_uint64 = 0;
+    /*
+     * AMX TILE XSAVE state (XTILE_DATA) is 8KB, which exceeds the
+     * current fixed 4KB XSAVE buffer size.
+     */
+    disabled_xsave_features.amx_tile_support = 1;
+    disabled_xsave_features.amx_bf16_support = 1;
+    disabled_xsave_features.amx_int8_support = 1;
+    disabled_xsave_features.amx_fp16_support = 1;
 
+    /*
+     * query host for supported processor features and disable unsupported
+     * features: (0 means supported, 1 means disabled, hence the negation)
+     */
+    ret = get_host_partition_property(mshv_fd,
+                                      HV_PARTITION_PROPERTY_PROCESSOR_FEATURES0,
+                                      &host_proc_features);
+    if (ret < 0) {
+        error_report("Failed to get host processor feature bank 0");
+        return -1;
+    }
+    args.pt_cpu_fbanks[0] = ~host_proc_features;
+
+    ret = get_host_partition_property(mshv_fd,
+                                      HV_PARTITION_PROPERTY_PROCESSOR_FEATURES1,
+                                      &host_proc_features);
+    if (ret < 0) {
+        error_report("Failed to get host processor feature bank 1");
+        return -1;
+    }
+    args.pt_cpu_fbanks[1] = ~host_proc_features;
+
+    /* arch-specific features we disable regardless of host support */
+    mshv_arch_disable_partition_proc_features(&disabled_partition_features);
+    args.pt_cpu_fbanks[0] |= disabled_partition_features.as_uint64[0];
+    args.pt_cpu_fbanks[1] |= disabled_partition_features.as_uint64[1];
+
+    /* populate args structure */
     args.pt_flags = pt_flags;
-    args.pt_isolation = pt_isolation;
+    args.pt_isolation = MSHV_PT_ISOLATION_NONE;
+    args.pt_disabled_xsave = disabled_xsave_features.as_uint64;
+    args.pt_num_cpu_fbanks = MSHV_NUM_CPU_FEATURES_BANKS;
 
     ret = ioctl(mshv_fd, MSHV_CREATE_PARTITION, &args);
     if (ret < 0) {
@@ -204,18 +301,10 @@ static int create_vm(int mshv_fd, int *vm_fd)
         return -1;
     }
 
-    ret = mshv_reserve_ioapic_msi_routes(*vm_fd);
-    if (ret < 0) {
-        return -1;
-    }
-
     ret = mshv_arch_post_init_vm(*vm_fd);
     if (ret < 0) {
         return -1;
     }
-
-    /* Always create a frozen partition */
-    pause_vm(*vm_fd);
 
     return 0;
 }
@@ -371,6 +460,9 @@ static MemoryListener mshv_memory_listener = {
     .region_del = mem_region_del,
     .eventfd_add = mem_ioeventfd_add,
     .eventfd_del = mem_ioeventfd_del,
+    .log_sync = mshv_log_sync,
+    .log_global_start = mshv_log_global_start,
+    .log_global_stop = mshv_log_global_stop,
 };
 
 static MemoryListener mshv_io_listener = {
@@ -415,17 +507,21 @@ static int mshv_init_vcpu(CPUState *cpu)
     int ret;
 
     cpu->accel = g_new0(AccelCPUState, 1);
-    mshv_arch_init_vcpu(cpu);
 
     ret = mshv_create_vcpu(vm_fd, vp_index, &cpu->accel->cpufd);
     if (ret < 0) {
         return -1;
     }
 
-    cpu->accel->dirty = true;
+    mshv_arch_init_vcpu(cpu);
+    cpu->vcpu_dirty = true;
 
     return 0;
 }
+
+static SaveVMHandlers savevm_mshv = {
+    .load_cleanup = mshv_load_cleanup,
+};
 
 static int mshv_init(AccelState *as, MachineState *ms)
 {
@@ -450,31 +546,34 @@ static int mshv_init(AccelState *as, MachineState *ms)
 
     mshv_init_mmio_emu();
 
-    mshv_init_msicontrol();
-
     ret = create_vm(mshv_fd, &vm_fd);
     if (ret < 0) {
         close(mshv_fd);
         return -1;
     }
 
-    ret = resume_vm(vm_fd);
+    s->vm = vm_fd;
+    s->fd = mshv_fd;
+
+    ret = get_proc_features(vm_fd, &s->processor_features);
     if (ret < 0) {
-        close(mshv_fd);
-        close(vm_fd);
         return -1;
     }
 
-    s->vm = vm_fd;
-    s->fd = mshv_fd;
     s->nr_as = 1;
     s->as = g_new0(MshvAddressSpace, s->nr_as);
 
     mshv_state = s;
 
+    mshv_init_irq_routing(s);
+
     register_mshv_memory_listener(s, &s->memory_listener, &address_space_memory,
                                   0, "mshv-memory");
     memory_listener_register(&mshv_io_listener, &address_space_io);
+
+    register_savevm_live("mshv", 0, 1, &savevm_mshv, s);
+
+    mshv_clock_init();
 
     return 0;
 }
@@ -502,15 +601,22 @@ static int mshv_cpu_exec(CPUState *cpu)
     cpu_exec_start(cpu);
 
     do {
-        if (cpu->accel->dirty) {
-            ret = mshv_arch_put_registers(cpu);
+        if (cpu->vcpu_dirty) {
+            ret = mshv_arch_store_vcpu_state(cpu);
             if (ret) {
                 error_report("Failed to put registers after init: %s",
                               strerror(-ret));
                 ret = -1;
                 break;
             }
-            cpu->accel->dirty = false;
+            cpu->vcpu_dirty = false;
+        }
+
+        /* Corresponding store-release is in cpu_exit. */
+        if (qatomic_load_acquire(&cpu->exit_request)) {
+            trace_mshv_interrupt_exit_request(cpu->cpu_index);
+            ret = EXCP_INTERRUPT;
+            break;
         }
 
         ret = mshv_run_vcpu(mshv_state->vm, cpu, &mshv_msg, &exit_reason);
@@ -540,17 +646,13 @@ static int mshv_cpu_exec(CPUState *cpu)
 }
 
 /*
- * The signal handler is triggered when QEMU's main thread receives a SIG_IPI
- * (SIGUSR1). This signal causes the current CPU thread to be kicked, forcing a
- * VM exit on the CPU. The VM exit generates an exit reason that breaks the loop
- * (see mshv_cpu_exec). If the exit is due to a Ctrl+A+x command, the system
- * will shut down. For other cases, the system will continue running.
+ * We need a dummy handler to make SIG_IPI a deliverable signal. The kernel
+ * handler will be woken up by the caught signal and instruct the hypervisor
+ * to suspend execution (the concrete mechanism differs between schedulers)
+ * and return to userspace.
  */
-static void sa_ipi_handler(int sig)
+static void dummy_handler(int sig)
 {
-    /* TODO: call IOCTL to set_immediate_exit, once implemented. */
-
-    qemu_cpu_kick_self();
 }
 
 static void init_signal(CPUState *cpu)
@@ -560,7 +662,7 @@ static void init_signal(CPUState *cpu)
     sigset_t set;
 
     memset(&sigact, 0, sizeof(sigact));
-    sigact.sa_handler = sa_ipi_handler;
+    sigact.sa_handler = dummy_handler;
     sigaction(SIG_IPI, &sigact, NULL);
 
     pthread_sigmask(SIG_BLOCK, NULL, &set);
@@ -625,13 +727,13 @@ static void mshv_start_vcpu_thread(CPUState *cpu)
 static void do_mshv_cpu_synchronize_post_init(CPUState *cpu,
                                               run_on_cpu_data arg)
 {
-    int ret = mshv_arch_put_registers(cpu);
+    int ret = mshv_arch_store_vcpu_state(cpu);
     if (ret < 0) {
         error_report("Failed to put registers after init: %s", strerror(-ret));
         abort();
     }
 
-    cpu->accel->dirty = false;
+    cpu->vcpu_dirty = false;
 }
 
 static void mshv_cpu_synchronize_post_init(CPUState *cpu)
@@ -641,20 +743,20 @@ static void mshv_cpu_synchronize_post_init(CPUState *cpu)
 
 static void mshv_cpu_synchronize_post_reset(CPUState *cpu)
 {
-    int ret = mshv_arch_put_registers(cpu);
+    int ret = mshv_arch_store_vcpu_state(cpu);
     if (ret) {
         error_report("Failed to put registers after reset: %s",
                      strerror(-ret));
         cpu_dump_state(cpu, stderr, CPU_DUMP_CODE);
         vm_stop(RUN_STATE_INTERNAL_ERROR);
     }
-    cpu->accel->dirty = false;
+    cpu->vcpu_dirty = false;
 }
 
 static void do_mshv_cpu_synchronize_pre_loadvm(CPUState *cpu,
                                                run_on_cpu_data arg)
 {
-    cpu->accel->dirty = true;
+    cpu->vcpu_dirty = true;
 }
 
 static void mshv_cpu_synchronize_pre_loadvm(CPUState *cpu)
@@ -664,8 +766,8 @@ static void mshv_cpu_synchronize_pre_loadvm(CPUState *cpu)
 
 static void do_mshv_cpu_synchronize(CPUState *cpu, run_on_cpu_data arg)
 {
-    if (!cpu->accel->dirty) {
-        int ret = mshv_load_regs(cpu);
+    if (!cpu->vcpu_dirty) {
+        int ret = mshv_arch_load_vcpu_state(cpu);
         if (ret < 0) {
             error_report("Failed to load registers for vcpu %d",
                          cpu->cpu_index);
@@ -674,13 +776,13 @@ static void do_mshv_cpu_synchronize(CPUState *cpu, run_on_cpu_data arg)
             vm_stop(RUN_STATE_INTERNAL_ERROR);
         }
 
-        cpu->accel->dirty = true;
+        cpu->vcpu_dirty = true;
     }
 }
 
 static void mshv_cpu_synchronize(CPUState *cpu)
 {
-    if (!cpu->accel->dirty) {
+    if (!cpu->vcpu_dirty) {
         run_on_cpu(cpu, do_mshv_cpu_synchronize, RUN_ON_CPU_NULL);
     }
 }
@@ -736,6 +838,7 @@ static void mshv_accel_ops_class_init(ObjectClass *oc, const void *data)
     ops->synchronize_state = mshv_cpu_synchronize;
     ops->synchronize_pre_loadvm = mshv_cpu_synchronize_pre_loadvm;
     ops->cpus_are_resettable = mshv_cpus_are_resettable;
+    ops->cpu_thread_is_idle = mshv_vcpu_thread_is_idle;
     ops->handle_interrupt = generic_handle_interrupt;
 }
 

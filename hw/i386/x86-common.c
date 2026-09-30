@@ -158,7 +158,7 @@ static CPUArchId *x86_find_cpu_slot(MachineState *ms, uint32_t id, int *idx)
     return found_cpu;
 }
 
-void x86_cpu_plug(HotplugHandler *hotplug_dev,
+void x86_cpu_plug(const HotplugHandler *hotplug_dev,
                   DeviceState *dev, Error **errp)
 {
     CPUArchId *found_cpu;
@@ -199,7 +199,7 @@ out:
     error_propagate(errp, local_err);
 }
 
-void x86_cpu_unplug_request_cb(HotplugHandler *hotplug_dev,
+void x86_cpu_unplug_request_cb(const HotplugHandler *hotplug_dev,
                                DeviceState *dev, Error **errp)
 {
     int idx = -1;
@@ -222,7 +222,7 @@ void x86_cpu_unplug_request_cb(HotplugHandler *hotplug_dev,
                                    errp);
 }
 
-void x86_cpu_unplug_cb(HotplugHandler *hotplug_dev,
+void x86_cpu_unplug_cb(const HotplugHandler *hotplug_dev,
                        DeviceState *dev, Error **errp)
 {
     CPUArchId *found_cpu;
@@ -248,7 +248,7 @@ void x86_cpu_unplug_cb(HotplugHandler *hotplug_dev,
     error_propagate(errp, local_err);
 }
 
-void x86_cpu_pre_plug(HotplugHandler *hotplug_dev,
+void x86_cpu_pre_plug(const HotplugHandler *hotplug_dev,
                       DeviceState *dev, Error **errp)
 {
     int idx;
@@ -980,19 +980,8 @@ void x86_load_linux(X86MachineState *x86ms,
     fw_cfg_add_file(fw_cfg, "etc/boot/kernel", kernel, kernel_size);
 
     if (machine->shim_filename) {
-        GMappedFile *mapped_file;
-        GError *gerr = NULL;
-
-        mapped_file = g_mapped_file_new(machine->shim_filename, false, &gerr);
-        if (!mapped_file) {
-            fprintf(stderr, "qemu: error reading shim %s: %s\n",
-                    machine->shim_filename, gerr->message);
-            exit(1);
-        }
-
-        fw_cfg_add_file(fw_cfg, "etc/boot/shim",
-                        g_mapped_file_get_contents(mapped_file),
-                        g_mapped_file_get_length(mapped_file));
+        load_image_to_fw_cfg_file(fw_cfg, "etc/boot/shim",
+                                  machine->shim_filename);
     }
 
     if (sev_enabled()) {

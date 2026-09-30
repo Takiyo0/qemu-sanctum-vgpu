@@ -36,19 +36,9 @@ Monitor *monitor_cur(void)
     return NULL;
 }
 
-bool monitor_cur_is_qmp(void)
-{
-    return false;
-}
-
 Monitor *monitor_set_cur(Coroutine *co, Monitor *mon)
 {
     return NULL;
-}
-
-int monitor_vprintf(Monitor *mon, const char *fmt, va_list ap)
-{
-    return -1;
 }
 
 /*

@@ -314,13 +314,35 @@ class QemuSystemTest(QemuBaseTest):
         console_log.addHandler(self._console_log_fh)
 
     def set_machine(self, machinename):
-        # TODO: We should use QMP to get the list of available machines
-        if not self._machinehelp:
-            self._machinehelp = run(
-                [self.qemu_bin, '-M', 'help'],
-                capture_output=True, check=True, encoding='utf8').stdout
-        if self._machinehelp.find(machinename) < 0:
+        cls = type(self)
+
+        if not hasattr(cls, "_machines"):
+            tmp_vm = QEMUMachine(self.qemu_bin)
+            tmp_vm.set_machine('none')
+
+            try:
+                tmp_vm.launch()
+                resp = tmp_vm.qmp('query-machines')
+
+                machines = resp.get('return', [])
+                cls._machines = []
+                for m in machines:
+                    if 'name' in m:
+                        cls._machines.append(m['name'])
+                    if 'alias' in m:
+                        cls._machines.append(m['alias'])
+
+            finally:
+                try:
+                    tmp_vm.shutdown()
+                except Exception:
+                    pass
+
+        self._machines = cls._machines
+
+        if machinename not in self._machines:
             self.skipTest('no support for machine ' + machinename)
+
         self.machine = machinename
 
     def require_accelerator(self, accelerator):
@@ -347,6 +369,12 @@ class QemuSystemTest(QemuBaseTest):
             self.skipTest("%s accelerator does not seem to be "
                           "available" % accelerator)
 
+    def skipTestIfNoHMP(self):
+        commands = self.vm.cmd('query-commands')
+        if not any(cmd['name'] == 'human-monitor-command'
+                   for cmd in commands):
+            self.skipTest('HMP support is not available')
+
     def require_netdev(self, netdevname):
         helptxt = run([self.qemu_bin, '-M', 'none', '-netdev', 'help'],
                       capture_output=True, check=True, encoding='utf8').stdout
@@ -359,11 +387,12 @@ class QemuSystemTest(QemuBaseTest):
         if helptxt.find(devicename) < 0:
             self.skipTest('no support for device ' + devicename)
 
-    def _new_vm(self, name, *args):
+    def _new_vm(self, name, monitor_address):
         vm = QEMUMachine(self.qemu_bin,
                          name=name,
                          base_temp_dir=self.workdir,
-                         log_dir=self.log_file())
+                         log_dir=self.log_file(),
+                         monitor_address=monitor_address)
         self.log.debug('QEMUMachine "%s" created', name)
         self.log.debug('QEMUMachine "%s" temp_dir: %s', name, vm.temp_dir)
 
@@ -372,20 +401,17 @@ class QemuSystemTest(QemuBaseTest):
             vm.add_args("-chardev",
                         f"socket,id=backdoor,path={sockpath},server=on,wait=off",
                         "-mon", "chardev=backdoor,mode=control")
-
-        if args:
-            vm.add_args(*args)
         return vm
 
     @property
     def vm(self):
         return self.get_vm(name='default')
 
-    def get_vm(self, *args, name=None):
+    def get_vm(self, name=None, monitor_address=None):
         if not name:
             name = str(uuid.uuid4())
         if self._vms.get(name) is None:
-            self._vms[name] = self._new_vm(name, *args)
+            self._vms[name] = self._new_vm(name, monitor_address)
             if self.cpu is not None:
                 self._vms[name].add_args('-cpu', self.cpu)
             if self.machine is not None:

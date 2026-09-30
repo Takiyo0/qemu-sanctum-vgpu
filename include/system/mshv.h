@@ -21,6 +21,7 @@
 #include "qapi/qapi-types-common.h"
 #include "system/memory.h"
 #include "accel/accel-ops.h"
+#include "accel/accel-route.h"
 
 #ifdef COMPILING_PER_TARGET
 #ifdef CONFIG_MSHV
@@ -32,6 +33,7 @@
 #endif
 
 #define MSHV_MAX_MSI_ROUTES 4096
+#define MSHV_MIN_ALLOCATED_MSI_ROUTES 64
 
 #define MSHV_PAGE_SHIFT 12
 
@@ -39,25 +41,40 @@
 extern bool mshv_allowed;
 #define mshv_enabled() (mshv_allowed)
 #define mshv_msi_via_irqfd_enabled() mshv_enabled()
+#define mshv_irqchip_in_kernel() mshv_enabled()
 #else /* CONFIG_MSHV_IS_POSSIBLE */
 #define mshv_enabled() false
 #define mshv_msi_via_irqfd_enabled() mshv_enabled()
+#define mshv_irqchip_in_kernel() mshv_enabled()
 #endif
 
+#define TYPE_MSHV_ACCEL ACCEL_CLASS_NAME("mshv")
+
 typedef struct MshvState MshvState;
+
+DECLARE_INSTANCE_CHECKER(MshvState, MSHV_STATE,
+                         TYPE_MSHV_ACCEL)
+
 extern MshvState *mshv_state;
+
+/* clock (partition reference time) */
+void mshv_clock_init(void);
 
 /* interrupt */
 int mshv_request_interrupt(MshvState *mshv_state, uint32_t interrupt_type, uint32_t vector,
                            uint32_t vp_index, bool logical_destination_mode,
                            bool level_triggered);
 
-int mshv_irqchip_add_msi_route(int vector, PCIDevice *dev);
+int mshv_irqchip_add_msi_route(AccelRouteChange *c, int vector, PCIDevice *dev);
 int mshv_irqchip_update_msi_route(int virq, MSIMessage msg, PCIDevice *dev);
-void mshv_irqchip_commit_routes(void);
-void mshv_irqchip_release_virq(int virq);
+void mshv_irqchip_release_virq(MshvState *s, int virq);
+void mshv_irqchip_commit_routes(MshvState *s);
 int mshv_irqchip_add_irqfd_notifier_gsi(const EventNotifier *n,
                                         const EventNotifier *rn, int virq);
 int mshv_irqchip_remove_irqfd_notifier_gsi(const EventNotifier *n, int virq);
+void mshv_init_irq_routing(MshvState *s);
+
+/* cpuid */
+uint32_t mshv_get_supported_cpuid(uint32_t func, uint32_t idx, int reg);
 
 #endif

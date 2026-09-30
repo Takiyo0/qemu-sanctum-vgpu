@@ -1686,10 +1686,6 @@ static void gen_CMPccXADD(DisasContext *s, X86DecodedInsn *decode)
         ot_full |= MO_SIGN;
     }
 
-    /*
-     * cmpv will be moved to cc_src *after* cpu_regs[] is written back, so use
-     * tcg_gen_ext_tl instead of gen_ext_tl.
-     */
     tcg_gen_ext_tl(cmpv, cpu_regs[decode->op[1].n], ot_full);
 
     /*
@@ -1699,6 +1695,7 @@ static void gen_CMPccXADD(DisasContext *s, X86DecodedInsn *decode)
      * - s->cc_srcT: memory operand (lhs for comparison)
      * - cmpv: rhs for comparison
      */
+    s->cc_srcT = tcg_temp_new();
     gen_set_label(label_top);
     gen_op_ld_v(s, ot_full, s->cc_srcT, s->A0);
     tcg_gen_sub_tl(s->T0, s->cc_srcT, cmpv);
@@ -1800,11 +1797,12 @@ static void gen_CMPXCHG(DisasContext *s, X86DecodedInsn *decode)
     dest = gen_op_deposit_reg_v(s, ot, R_EAX, s->T0, oldv);
     tcg_gen_movcond_tl(TCG_COND_NE, dest, oldv, cmpv, s->T0, dest);
 
-    tcg_gen_mov_tl(s->cc_srcT, cmpv);
-    tcg_gen_sub_tl(cmpv, cmpv, oldv);
-    decode->cc_dst = cmpv;
+    s->cc_srcT = cmpv;
+    decode->cc_dst = tcg_temp_new();
     decode->cc_src = oldv;
     decode->cc_op = CC_OP_SUBB + ot;
+
+    tcg_gen_sub_tl(decode->cc_dst, cmpv, oldv);
 }
 
 static void gen_CMPXCHG16B(DisasContext *s, X86DecodedInsn *decode)
@@ -2722,7 +2720,7 @@ static void gen_NEG(DisasContext *s, X86DecodedInsn *decode)
 
     decode->cc_dst = s->T0;
     decode->cc_src = oldv;
-    tcg_gen_movi_tl(s->cc_srcT, 0);
+    s->cc_srcT = tcg_constant_tl(0);
     decode->cc_op = CC_OP_SUBB + ot;
 }
 
@@ -3424,7 +3422,9 @@ static void gen_rot_overflow(X86DecodedInsn *decode, TCGv result, TCGv old,
 /*
  * RCx operations are invariant modulo 8*operand_size+1.  For 8 and 16-bit operands,
  * this is less than 0x1f (the mask applied by gen_shift_count) so reduce further.
- * FIXME: are flags updated if the count is nonzero, but a multiple of (8 << op) + 1?
+ * A count that is a nonzero multiple of (8 << op) + 1 reduces to 0 and leaves
+ * CF and OF unmodified (confirmed against hardware that rcl $9,%al behaves
+ * exactly like rcl $0,%al).
  */
 static MemOp gen_rotc_count(DisasContext *s, X86DecodedInsn *decode,
                             bool *can_be_zero, TCGv *count, int unit)
@@ -3778,10 +3778,13 @@ static void gen_SAHF(DisasContext *s, X86DecodedInsn *decode)
         return gen_illegal_opcode(s);
     }
     tcg_gen_shri_tl(s->T0, cpu_regs[R_EAX], 8);
-    gen_neg_setcc(s, JCC_O << 1, cpu_cc_src);
-    tcg_gen_andi_tl(cpu_cc_src, cpu_cc_src, CC_O);
+    gen_neg_setcc(s, JCC_O << 1, s->T1);
+    tcg_gen_andi_tl(s->T1, s->T1, CC_O);
     tcg_gen_andi_tl(s->T0, s->T0, CC_S | CC_Z | CC_A | CC_P | CC_C);
-    tcg_gen_or_tl(cpu_cc_src, cpu_cc_src, s->T0);
+    tcg_gen_or_tl(s->T0, s->T0, s->T1);
+
+    decode->cc_src = s->T0;
+    decode->cc_op = CC_OP_EFLAGS;
 }
 
 static void gen_SALC(DisasContext *s, X86DecodedInsn *decode)
@@ -4109,6 +4112,7 @@ static void gen_SUB(DisasContext *s, X86DecodedInsn *decode)
 {
     MemOp ot = decode->op[1].ot;
 
+    s->cc_srcT = tcg_temp_new();
     if (s->prefix & PREFIX_LOCK) {
         tcg_gen_neg_tl(s->T0, s->T1);
         tcg_gen_atomic_fetch_add_tl(s->cc_srcT, s->A0, s->T0,

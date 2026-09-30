@@ -28,15 +28,21 @@ if not get_option('asan')
   tests_x86_64_system_quick += [ 'memlock' ]
 endif
 
+if igvm.found()
+  tests_x86_64_system_quick += [ 'vm_launch_update' ]
+endif
+
 tests_x86_64_system_thorough = [
   'acpi_bits',
   'hotplug_blk',
+  'hotplug_scsi',
   'hotplug_cpu',
   'intel_iommu',
   'kvm_xen',
   'linux_initrd',
   'multiprocess',
   'netdev_ethtool',
+  'nvme_migration',
   'replay',
   'reverse_debug',
   'tuxrun',

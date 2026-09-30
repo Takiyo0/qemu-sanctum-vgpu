@@ -8,6 +8,7 @@
     non_upper_case_globals,
     unnecessary_transmutes,
     unsafe_op_in_unsafe_fn,
+    clippy::complexity,
     clippy::pedantic,
     clippy::restriction,
     clippy::style,
@@ -20,7 +21,7 @@
 
 use common::Zeroable;
 use hwcore_sys::{qemu_irq, DeviceClass, DeviceState};
-use qom_sys::{InterfaceClass, Object, ObjectClass};
+use qom_sys::{Object, ObjectClass};
 use util_sys::{Error, EventNotifier, QEMUBH};
 
 #[cfg(MESON)]

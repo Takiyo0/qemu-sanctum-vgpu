@@ -869,7 +869,7 @@ static int kvm_virtio_pci_vq_vector_use(VirtIOPCIProxy *proxy,
     int ret;
 
     if (irqfd->users == 0) {
-        KVMRouteChange c = kvm_irqchip_begin_route_changes(kvm_state);
+        AccelRouteChange c = accel_irqchip_begin_route_changes();
         ret = accel_irqchip_add_msi_route(&c, vector, &proxy->pci_dev);
         if (ret < 0) {
             return ret;
@@ -1692,6 +1692,13 @@ static void virtio_pci_common_write(void *opaque, hwaddr addr,
         break;
     case VIRTIO_PCI_COMMON_Q_ENABLE:
         if (val == 1) {
+            if (proxy->vqs[vdev->queue_sel].enabled) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "%s: queue %d already enabled - "
+                              "reset queue before re-enabling\n",
+                              __func__, vdev->queue_sel);
+                break;
+            }
             virtio_queue_set_num(vdev, vdev->queue_sel,
                                  proxy->vqs[vdev->queue_sel].num);
             virtio_queue_set_rings(vdev, vdev->queue_sel,
@@ -2669,4 +2676,3 @@ static void virtio_pci_register_types(void)
 }
 
 type_init(virtio_pci_register_types)
-

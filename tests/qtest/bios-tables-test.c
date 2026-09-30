@@ -1416,6 +1416,26 @@ static void test_acpi_q35_tcg_numamem(void)
     free_test_data(&data);
 }
 
+static void test_acpi_q35_tcg_sp_mem(void)
+{
+    test_data data = {};
+
+    data.machine = MACHINE_Q35;
+    data.arch    = "x86",
+    data.variant = ".spmem";
+    test_acpi_one(" -m 128M,slots=4,maxmem=1G"
+                  " -object memory-backend-ram,id=ram0,size=128M"
+                  " -numa node,nodeid=0,memdev=ram0"
+                  " -numa node,nodeid=1"
+                  " -numa node,nodeid=2"
+                  " -object memory-backend-ram,id=spm0,size=128M"
+                  " -object memory-backend-ram,id=spm1,size=128M"
+                  " -device sp-mem,id=sp0,memdev=spm0,node=1"
+                  " -device sp-mem,id=sp1,memdev=spm1,node=2",
+                  &data);
+    free_test_data(&data);
+}
+
 static void test_acpi_q35_kvm_xapic(void)
 {
     test_data data = {};
@@ -1620,7 +1640,7 @@ static void test_acpi_aarch64_virt_tcg_memhp(void)
         .arch = "aarch64",
         .tcg_only = true,
         .uefi_fl1 = "pc-bios/edk2-aarch64-code.fd",
-        .uefi_fl2 = "pc-bios/edk2-arm-vars.fd",
+        .uefi_fl2 = "pc-bios/edk2-aarch64-vars.fd",
         .cd = "tests/data/uefi-boot-images/bios-tables-test.aarch64.iso.qcow2",
         .ram_start = 0x40000000ULL,
         .scan_len = 256ULL * MiB,
@@ -1651,7 +1671,7 @@ static void test_acpi_aarch64_virt_acpi_pci_hotplug(void)
         .arch = "aarch64",
         .tcg_only = true,
         .uefi_fl1 = "pc-bios/edk2-aarch64-code.fd",
-        .uefi_fl2 = "pc-bios/edk2-arm-vars.fd",
+        .uefi_fl2 = "pc-bios/edk2-aarch64-vars.fd",
         .cd = "tests/data/uefi-boot-images/bios-tables-test.aarch64.iso.qcow2",
         .ram_start = 0x40000000ULL,
         .scan_len = 256ULL * MiB,
@@ -1675,7 +1695,7 @@ static void test_acpi_aarch64_virt_pcie_root_port_hpoff(void)
         .arch = "aarch64",
         .tcg_only = true,
         .uefi_fl1 = "pc-bios/edk2-aarch64-code.fd",
-        .uefi_fl2 = "pc-bios/edk2-arm-vars.fd",
+        .uefi_fl2 = "pc-bios/edk2-aarch64-vars.fd",
         .cd = "tests/data/uefi-boot-images/bios-tables-test.aarch64.iso.qcow2",
         .ram_start = 0x40000000ULL,
         .scan_len = 256ULL * MiB,
@@ -1762,8 +1782,8 @@ static void test_acpi_riscv64_virt_tcg_numamem(void)
         .machine = "virt",
         .arch = "riscv64",
         .tcg_only = true,
-        .uefi_fl1 = "pc-bios/edk2-riscv-code.fd",
-        .uefi_fl2 = "pc-bios/edk2-riscv-vars.fd",
+        .uefi_fl1 = "pc-bios/edk2-riscv64-code.fd",
+        .uefi_fl2 = "pc-bios/edk2-riscv64-vars.fd",
         .cd = "tests/data/uefi-boot-images/bios-tables-test.riscv64.iso.qcow2",
         .ram_start = 0x80000000ULL,
         .scan_len = 128ULL * MiB,
@@ -1789,7 +1809,7 @@ static void test_acpi_aarch64_virt_tcg_numamem(void)
         .arch = "aarch64",
         .tcg_only = true,
         .uefi_fl1 = "pc-bios/edk2-aarch64-code.fd",
-        .uefi_fl2 = "pc-bios/edk2-arm-vars.fd",
+        .uefi_fl2 = "pc-bios/edk2-aarch64-vars.fd",
         .cd = "tests/data/uefi-boot-images/bios-tables-test.aarch64.iso.qcow2",
         .ram_start = 0x40000000ULL,
         .scan_len = 128ULL * MiB,
@@ -1812,7 +1832,7 @@ static void test_acpi_aarch64_virt_tcg_pxb(void)
         .arch = "aarch64",
         .tcg_only = true,
         .uefi_fl1 = "pc-bios/edk2-aarch64-code.fd",
-        .uefi_fl2 = "pc-bios/edk2-arm-vars.fd",
+        .uefi_fl2 = "pc-bios/edk2-aarch64-vars.fd",
         .ram_start = 0x40000000ULL,
         .scan_len = 128ULL * MiB,
     };
@@ -1845,7 +1865,7 @@ static void test_acpi_aarch64_virt_tcg_acpi_spcr(void)
         .arch = "aarch64",
         .tcg_only = true,
         .uefi_fl1 = "pc-bios/edk2-aarch64-code.fd",
-        .uefi_fl2 = "pc-bios/edk2-arm-vars.fd",
+        .uefi_fl2 = "pc-bios/edk2-aarch64-vars.fd",
         .cd = "tests/data/uefi-boot-images/bios-tables-test.aarch64.iso.qcow2",
         .ram_start = 0x40000000ULL,
         .scan_len = 128ULL * 1024 * 1024,
@@ -1863,8 +1883,8 @@ static void test_acpi_riscv64_virt_tcg_acpi_spcr(void)
         .machine = "virt",
         .arch = "riscv64",
         .tcg_only = true,
-        .uefi_fl1 = "pc-bios/edk2-riscv-code.fd",
-        .uefi_fl2 = "pc-bios/edk2-riscv-vars.fd",
+        .uefi_fl1 = "pc-bios/edk2-riscv64-code.fd",
+        .uefi_fl2 = "pc-bios/edk2-riscv64-vars.fd",
         .cd = "tests/data/uefi-boot-images/bios-tables-test.riscv64.iso.qcow2",
         .ram_start = 0x80000000ULL,
         .scan_len = 128ULL * 1024 * 1024,
@@ -1925,7 +1945,7 @@ static void test_acpi_aarch64_virt_tcg_acpi_hmat(void)
         .arch = "aarch64",
         .tcg_only = true,
         .uefi_fl1 = "pc-bios/edk2-aarch64-code.fd",
-        .uefi_fl2 = "pc-bios/edk2-arm-vars.fd",
+        .uefi_fl2 = "pc-bios/edk2-aarch64-vars.fd",
         .cd = "tests/data/uefi-boot-images/bios-tables-test.aarch64.iso.qcow2",
         .ram_start = 0x40000000ULL,
         .scan_len = 128ULL * MiB,
@@ -2178,8 +2198,8 @@ static void test_acpi_riscv64_virt_tcg(void)
         .machine = "virt",
         .arch = "riscv64",
         .tcg_only = true,
-        .uefi_fl1 = "pc-bios/edk2-riscv-code.fd",
-        .uefi_fl2 = "pc-bios/edk2-riscv-vars.fd",
+        .uefi_fl1 = "pc-bios/edk2-riscv64-code.fd",
+        .uefi_fl2 = "pc-bios/edk2-riscv64-vars.fd",
         .cd = "tests/data/uefi-boot-images/bios-tables-test.riscv64.iso.qcow2",
         .ram_start = 0x80000000ULL,
         .scan_len = 128ULL * MiB,
@@ -2201,7 +2221,7 @@ static void test_acpi_aarch64_virt_tcg(void)
         .arch = "aarch64",
         .tcg_only = true,
         .uefi_fl1 = "pc-bios/edk2-aarch64-code.fd",
-        .uefi_fl2 = "pc-bios/edk2-arm-vars.fd",
+        .uefi_fl2 = "pc-bios/edk2-aarch64-vars.fd",
         .cd = "tests/data/uefi-boot-images/bios-tables-test.aarch64.iso.qcow2",
         .ram_start = 0x40000000ULL,
         .scan_len = 128ULL * MiB,
@@ -2222,7 +2242,7 @@ static void test_acpi_aarch64_virt_tcg_topology(void)
         .variant = ".topology",
         .tcg_only = true,
         .uefi_fl1 = "pc-bios/edk2-aarch64-code.fd",
-        .uefi_fl2 = "pc-bios/edk2-arm-vars.fd",
+        .uefi_fl2 = "pc-bios/edk2-aarch64-vars.fd",
         .cd = "tests/data/uefi-boot-images/bios-tables-test.aarch64.iso.qcow2",
         .ram_start = 0x40000000ULL,
         .scan_len = 128ULL * MiB,
@@ -2245,7 +2265,7 @@ static void test_acpi_aarch64_virt_tcg_its_off(void)
         .variant = ".its_off",
         .tcg_only = true,
         .uefi_fl1 = "pc-bios/edk2-aarch64-code.fd",
-        .uefi_fl2 = "pc-bios/edk2-arm-vars.fd",
+        .uefi_fl2 = "pc-bios/edk2-aarch64-vars.fd",
         .cd = "tests/data/uefi-boot-images/bios-tables-test.aarch64.iso.qcow2",
         .ram_start = 0x40000000ULL,
         .scan_len = 128ULL * 1024 * 1024,
@@ -2264,7 +2284,7 @@ static void test_acpi_aarch64_virt_tcg_msi_gicv2m(void)
         .variant = ".msi_gicv2m",
         .tcg_only = true,
         .uefi_fl1 = "pc-bios/edk2-aarch64-code.fd",
-        .uefi_fl2 = "pc-bios/edk2-arm-vars.fd",
+        .uefi_fl2 = "pc-bios/edk2-aarch64-vars.fd",
         .cd = "tests/data/uefi-boot-images/bios-tables-test.aarch64.iso.qcow2",
         .ram_start = 0x40000000ULL,
         .scan_len = 128ULL * 1024 * 1024,
@@ -2272,6 +2292,43 @@ static void test_acpi_aarch64_virt_tcg_msi_gicv2m(void)
 
     test_acpi_one("-cpu cortex-a57 "
                   "-M gic-version=3,iommu=smmuv3,msi=gicv2m", &data);
+    free_test_data(&data);
+}
+
+static void test_acpi_aarch64_virt_tcg_wdat(void)
+{
+    test_data data = {
+        .machine = "virt",
+        .arch = "aarch64",
+        .variant = ".wdat",
+        .tcg_only = true,
+        .uefi_fl1 = "pc-bios/edk2-aarch64-code.fd",
+        .uefi_fl2 = "pc-bios/edk2-aarch64-vars.fd",
+        .cd = "tests/data/uefi-boot-images/bios-tables-test.aarch64.iso.qcow2",
+        .ram_start = 0x40000000ULL,
+        .scan_len = 128ULL * MiB,
+    };
+
+    test_acpi_one("-cpu cortex-a57 "
+                  "-device sbsa-gwdt,wdat=on", &data);
+    free_test_data(&data);
+}
+
+static void test_acpi_aarch64_virt_tcg_gtdt_wd(void)
+{
+    test_data data = {
+        .machine = "virt",
+        .arch = "aarch64",
+        .variant = ".gwdt",
+        .tcg_only = true,
+        .uefi_fl1 = "pc-bios/edk2-aarch64-code.fd",
+        .uefi_fl2 = "pc-bios/edk2-aarch64-vars.fd",
+        .cd = "tests/data/uefi-boot-images/bios-tables-test.aarch64.iso.qcow2",
+        .ram_start = 0x40000000ULL,
+        .scan_len = 128ULL * MiB,
+    };
+
+    test_acpi_one("-cpu cortex-a57 -device sbsa-gwdt", &data);
     free_test_data(&data);
 }
 
@@ -2350,7 +2407,7 @@ static void test_acpi_aarch64_virt_viot(void)
         .variant = ".viot",
         .tcg_only = true,
         .uefi_fl1 = "pc-bios/edk2-aarch64-code.fd",
-        .uefi_fl2 = "pc-bios/edk2-arm-vars.fd",
+        .uefi_fl2 = "pc-bios/edk2-aarch64-vars.fd",
         .cd = "tests/data/uefi-boot-images/bios-tables-test.aarch64.iso.qcow2",
         .ram_start = 0x40000000ULL,
         .scan_len = 128ULL * MiB,
@@ -2368,7 +2425,7 @@ static void test_acpi_aarch64_virt_smmuv3_legacy(void)
         .arch = "aarch64",
         .tcg_only = true,
         .uefi_fl1 = "pc-bios/edk2-aarch64-code.fd",
-        .uefi_fl2 = "pc-bios/edk2-arm-vars.fd",
+        .uefi_fl2 = "pc-bios/edk2-aarch64-vars.fd",
         .ram_start = 0x40000000ULL,
         .scan_len = 128ULL * MiB,
     };
@@ -2407,7 +2464,7 @@ static void test_acpi_aarch64_virt_smmuv3_dev(void)
         .arch = "aarch64",
         .tcg_only = true,
         .uefi_fl1 = "pc-bios/edk2-aarch64-code.fd",
-        .uefi_fl2 = "pc-bios/edk2-arm-vars.fd",
+        .uefi_fl2 = "pc-bios/edk2-aarch64-vars.fd",
         .ram_start = 0x40000000ULL,
         .scan_len = 128ULL * MiB,
     };
@@ -2559,6 +2616,14 @@ static void test_oem_fields(test_data *data)
             continue;
         }
 
+        /* Firmware Performance Data created by EDK2 not QEMU */
+        if (compare_signature(sdt, "FPDT")) {
+            continue;
+        }
+
+        if (verbosity_level >= 2) {
+            fprintf(stderr, "Checking '%.4s'\n", sdt->aml);
+        }
         g_assert(strncmp((char *)sdt->aml + 10, OEM_ID, 6) == 0);
         g_assert(strncmp((char *)sdt->aml + 16, OEM_TABLE_ID, 8) == 0);
     }
@@ -2626,7 +2691,7 @@ static void test_acpi_aarch64_virt_oem_fields(void)
         .arch = "aarch64",
         .tcg_only = true,
         .uefi_fl1 = "pc-bios/edk2-aarch64-code.fd",
-        .uefi_fl2 = "pc-bios/edk2-arm-vars.fd",
+        .uefi_fl2 = "pc-bios/edk2-aarch64-vars.fd",
         .cd = "tests/data/uefi-boot-images/bios-tables-test.aarch64.iso.qcow2",
         .ram_start = 0x40000000ULL,
         .scan_len = 128ULL * MiB,
@@ -2807,6 +2872,7 @@ int main(int argc, char *argv[])
             if (strcmp(arch, "i386")) {
                 qtest_add_func("acpi/q35/memhp", test_acpi_q35_tcg_memhp);
                 qtest_add_func("acpi/q35/dimmpxm", test_acpi_q35_tcg_dimm_pxm);
+                qtest_add_func("acpi/q35/sp-mem", test_acpi_q35_tcg_sp_mem);
                 qtest_add_func("acpi/q35/acpihmat",
                                test_acpi_q35_tcg_acpi_hmat);
                 qtest_add_func("acpi/q35/mmio64", test_acpi_q35_tcg_mmio64);
@@ -2893,6 +2959,10 @@ int main(int argc, char *argv[])
                 qtest_add_func("acpi/virt/smmuv3-dev",
                                test_acpi_aarch64_virt_smmuv3_dev);
             }
+            qtest_add_func("acpi/virt/acpi-watchdog",
+                           test_acpi_aarch64_virt_tcg_wdat);
+            qtest_add_func("acpi/virt/gwdt-watchdog",
+                           test_acpi_aarch64_virt_tcg_gtdt_wd);
         }
     } else if (strcmp(arch, "riscv64") == 0) {
         if (has_tcg && qtest_has_device("virtio-blk-pci")) {

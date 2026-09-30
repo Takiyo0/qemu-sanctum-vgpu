@@ -434,9 +434,12 @@ host_memory_backend_memory_complete(UserCreatable *uc, Error **errp)
 }
 
 static bool
-host_memory_backend_can_be_deleted(UserCreatable *uc)
+host_memory_backend_prepare_delete(UserCreatable *uc, Error **errp)
 {
     if (host_memory_backend_is_mapped(MEMORY_BACKEND(uc))) {
+        error_setg(errp,
+                   "Cannot delete host memory backend '%s' which is mapped",
+                   object_get_canonical_path_component(OBJECT(uc)));
         return false;
     } else {
         return true;
@@ -508,7 +511,7 @@ host_memory_backend_class_init(ObjectClass *oc, const void *data)
     UserCreatableClass *ucc = USER_CREATABLE_CLASS(oc);
 
     ucc->complete = host_memory_backend_memory_complete;
-    ucc->can_be_deleted = host_memory_backend_can_be_deleted;
+    ucc->prepare_delete = host_memory_backend_prepare_delete;
 
     object_class_property_add_bool(oc, "merge",
         host_memory_backend_get_merge,
@@ -536,13 +539,13 @@ host_memory_backend_class_init(ObjectClass *oc, const void *data)
         object_property_allow_set_link, OBJ_PROP_LINK_STRONG);
     object_class_property_set_description(oc, "prealloc-context",
         "Context to use for creating CPU threads for preallocation");
-    object_class_property_add(oc, "size", "int",
+    object_class_property_add(oc, "size", "size",
         host_memory_backend_get_size,
         host_memory_backend_set_size,
         NULL, NULL);
     object_class_property_set_description(oc, "size",
         "Size of the memory region (ex: 500M)");
-    object_class_property_add(oc, "host-nodes", "int",
+    object_class_property_add(oc, "host-nodes", "[uint16]",
         host_memory_backend_get_host_nodes,
         host_memory_backend_set_host_nodes,
         NULL, NULL);

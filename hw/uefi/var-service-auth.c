@@ -201,16 +201,21 @@ static efi_status uefi_vars_check_auth_2_sb(uefi_vars_state *uv,
 
     siglist = uefi_vars_find_siglist(uv, var);
     if (!siglist && setup_mode_is_active(uv) && uefi_vars_is_sb_pk(var)) {
-        /* check PK is self-signed */
-        uefi_variable tmp = {
-            .guid       = EfiGlobalVariable,
-            .name       = (uint16_t *)name_pk,
-            .name_size  = sizeof(name_pk),
-            .attributes = sigdb_attrs,
-            .data       = data + data_offset,
-            .data_size  = va->data_size - data_offset,
-        };
-        return uefi_vars_check_pkcs7_2(&tmp, NULL, NULL, va, data);
+        /* edk2 config option is PcdRequireSelfSignedPk */
+        if (uv->require_self_signed_pk) {
+            /* check PK is self-signed */
+            uefi_variable tmp = {
+                .guid       = EfiGlobalVariable,
+                .name       = (uint16_t *)name_pk,
+                .name_size  = sizeof(name_pk),
+                .attributes = sigdb_attrs,
+                .data       = data + data_offset,
+                .data_size  = va->data_size - data_offset,
+            };
+            return uefi_vars_check_pkcs7_2(&tmp, NULL, NULL, va, data);
+        } else {
+            return true;
+        }
     }
 
     return uefi_vars_check_pkcs7_2(siglist, NULL, NULL, va, data);
@@ -295,6 +300,13 @@ efi_status uefi_vars_check_secure_boot(uefi_vars_state *uv, uefi_variable *var)
         uefi_str_equal(var->name, var->name_size,
                        name_custom_mode, sizeof(name_custom_mode)) &&
         uv->disable_custom_mode) {
+        return EFI_WRITE_PROTECTED;
+    }
+
+    /* reject SetupMode updates */
+    if (qemu_uuid_is_equal(&var->guid, &EfiGlobalVariable) &&
+        uefi_str_equal(var->name, var->name_size,
+                       name_setup_mode, sizeof(name_setup_mode))) {
         return EFI_WRITE_PROTECTED;
     }
 

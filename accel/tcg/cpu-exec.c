@@ -308,7 +308,7 @@ static bool check_for_breakpoints_slow(CPUState *cpu, vaddr pc,
      * so that one could (gdb) singlestep into the guest kernel's
      * architectural breakpoint handler.
      */
-    if (cpu->singlestep_enabled) {
+    if (cpu_single_stepping(cpu)) {
         return false;
     }
 
@@ -460,7 +460,7 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
          * counter hit zero); we must restore the guest PC to the address
          * of the start of the TB.
          */
-        CPUClass *cc = cpu->cc;
+        const CPUClass *cc = cpu->cc;
         const TCGCPUOps *tcg_ops = cc->tcg_ops;
 
         if (tcg_ops->synchronize_from_tb) {
@@ -485,7 +485,7 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
      * raise a debug exception.  Single-step with another exception
      * is handled in cpu_handle_exception.
      */
-    if (unlikely(cpu->singlestep_enabled) && cpu->exception_index == -1) {
+    if (unlikely(cpu_single_stepping(cpu)) && cpu->exception_index == -1) {
         cpu->exception_index = EXCP_DEBUG;
         cpu_loop_exit(cpu);
     }
@@ -653,23 +653,21 @@ static inline void tb_add_jump(TranslationBlock *tb, int n,
     qemu_spin_unlock(&tb_next->jmp_lock);
 }
 
+#ifndef CONFIG_USER_ONLY
 static inline bool cpu_handle_halt(CPUState *cpu)
 {
-#ifndef CONFIG_USER_ONLY
-    if (cpu->halted) {
-        const TCGCPUOps *tcg_ops = cpu->cc->tcg_ops;
-        bool leave_halt = tcg_ops->cpu_exec_halt(cpu);
+    const TCGCPUOps *tcg_ops = cpu->cc->tcg_ops;
+    bool leave_halt = tcg_ops->cpu_exec_halt(cpu);
 
-        if (!leave_halt) {
-            return true;
-        }
-
-        cpu->halted = 0;
+    if (!leave_halt) {
+        return true;
     }
-#endif /* !CONFIG_USER_ONLY */
+
+    cpu->halted = 0; /* allow execution */
 
     return false;
 }
+#endif /* !CONFIG_USER_ONLY */
 
 static inline void cpu_handle_debug_exception(CPUState *cpu)
 {
@@ -687,7 +685,7 @@ static inline void cpu_handle_debug_exception(CPUState *cpu)
     }
 }
 
-static inline bool cpu_handle_exception(CPUState *cpu, int *ret)
+static inline bool cpu_handle_exception(CPUState *cpu, int *excp)
 {
     if (cpu->exception_index < 0) {
 #ifndef CONFIG_USER_ONLY
@@ -703,8 +701,8 @@ static inline bool cpu_handle_exception(CPUState *cpu, int *ret)
 
     if (cpu->exception_index >= EXCP_INTERRUPT) {
         /* exit request from the cpu execution loop */
-        *ret = cpu->exception_index;
-        if (*ret == EXCP_DEBUG) {
+        *excp = cpu->exception_index;
+        if (*excp == EXCP_DEBUG) {
             cpu_handle_debug_exception(cpu);
         }
         cpu->exception_index = -1;
@@ -720,7 +718,7 @@ static inline bool cpu_handle_exception(CPUState *cpu, int *ret)
     if (tcg_ops->fake_user_interrupt) {
         tcg_ops->fake_user_interrupt(cpu);
     }
-    *ret = cpu->exception_index;
+    *excp = cpu->exception_index;
     cpu->exception_index = -1;
     return true;
 #else
@@ -732,19 +730,19 @@ static inline bool cpu_handle_exception(CPUState *cpu, int *ret)
         bql_unlock();
         cpu->exception_index = -1;
 
-        if (unlikely(cpu->singlestep_enabled)) {
+        if (unlikely(cpu_single_stepping(cpu))) {
             /*
              * After processing the exception, ensure an EXCP_DEBUG is
              * raised when single-stepping so that GDB doesn't miss the
              * next instruction.
              */
-            *ret = EXCP_DEBUG;
+            *excp = EXCP_DEBUG;
             cpu_handle_debug_exception(cpu);
             return true;
         }
     } else if (!replay_has_interrupt()) {
         /* give a chance to iothread in replay mode */
-        *ret = EXCP_INTERRUPT;
+        *excp = EXCP_INTERRUPT;
         return true;
     }
 #endif
@@ -828,7 +826,7 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
                 return true;
             }
 
-            if (unlikely(cpu->singlestep_enabled & SSTEP_NOIRQ)) {
+            if (unlikely(cpu->singlestep_flags & SSTEP_NOIRQ)) {
                 /* Mask out external interrupts for this step. */
                 interrupt_request &= ~CPU_INTERRUPT_SSTEP_MASK;
             }
@@ -849,7 +847,7 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
                  * raised when single-stepping so that GDB doesn't miss the
                  * next instruction.
                  */
-                if (unlikely(cpu->singlestep_enabled)) {
+                if (unlikely(cpu_single_stepping(cpu))) {
                     cpu->exception_index = EXCP_DEBUG;
                     bql_unlock();
                     return true;
@@ -935,10 +933,10 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
 static int __attribute__((noinline))
 cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
 {
-    int ret;
+    int excp;
 
     /* if an exception is pending, we execute it here */
-    while (!cpu_handle_exception(cpu, &ret)) {
+    while (!cpu_handle_exception(cpu, &excp)) {
         TranslationBlock *last_tb = NULL;
         int tb_exit = 0;
 
@@ -1006,7 +1004,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
             align_clocks(sc, cpu);
         }
     }
-    return ret;
+    return excp;
 }
 
 static int cpu_exec_setjmp(CPUState *cpu, SyncClocks *sc)
@@ -1021,15 +1019,20 @@ static int cpu_exec_setjmp(CPUState *cpu, SyncClocks *sc)
 
 int cpu_exec(CPUState *cpu)
 {
-    int ret;
+    int excp;
     SyncClocks sc = { 0 };
 
     /* replay_interrupt may need current_cpu */
     current_cpu = cpu;
 
-    if (cpu_handle_halt(cpu)) {
-        return EXCP_HALTED;
+#ifndef CONFIG_USER_ONLY
+    if (cpu->halted) {
+        if (cpu_handle_halt(cpu)) {
+            return EXCP_HALTED;
+        }
+        assert(!cpu->halted);
     }
+#endif
 
     RCU_READ_LOCK_GUARD();
     cpu_exec_enter(cpu);
@@ -1042,10 +1045,10 @@ int cpu_exec(CPUState *cpu)
      */
     init_delay_params(&sc, cpu);
 
-    ret = cpu_exec_setjmp(cpu, &sc);
+    excp = cpu_exec_setjmp(cpu, &sc);
 
     cpu_exec_exit(cpu);
-    return ret;
+    return excp;
 }
 
 bool tcg_exec_realizefn(CPUState *cpu, Error **errp)

@@ -34,9 +34,18 @@ typedef struct target_elf_gregset_t {
     abi_ulong pad[16];     /* pad to 80 elements                 [64..79] */
 } target_elf_gregset_t;
 
-#define LO_COMMPAGE             0
+#define COMMPAGE                0
 #define STACK_GROWS_DOWN        0
 #define STACK_ALIGNMENT         64
 #define VDSO_HEADER             "vdso.c.inc"
+
+#define HAVE_ELF_CORE_FPREGS    1
+
+/*
+ * Matches the kernel's elf_fpregset_t (ELF_NFPREG = 32): fr0-fr31.
+ */
+typedef struct target_elf_fpregset_t {
+    uint64_t fpr[32];
+} target_elf_fpregset_t;
 
 #endif

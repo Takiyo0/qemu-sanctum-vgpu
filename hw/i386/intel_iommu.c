@@ -1964,13 +1964,13 @@ static bool vtd_iova_fs_check_canonical(IntelIOMMUState *s, uint64_t iova,
     }
 }
 
-static MemTxResult vtd_set_flag_in_pte(dma_addr_t base_addr, uint32_t index,
-                                       uint64_t pte, uint64_t flag)
+static MemTxResult vtd_set_flags_in_pte(dma_addr_t base_addr, uint32_t index,
+                                       uint64_t pte, uint64_t flags)
 {
-    if (pte & flag) {
+    if ((pte & flags) == flags) {
         return MEMTX_OK;
     }
-    pte |= flag;
+    pte |= flags;
     pte = cpu_to_le64(pte);
     return dma_memory_write(&address_space_memory,
                             base_addr + index * sizeof(pte),
@@ -2039,11 +2039,11 @@ static int vtd_iova_to_fspte(IntelIOMMUState *s, VTDContextEntry *ce,
             return -VTD_FR_FS_PAGING_ENTRY_RSVD;
         }
 
-        if (vtd_is_last_pte(fspte, *fspte_level) && is_write) {
+        if (vtd_is_last_pte(fspte, *fspte_level) && *writes && is_write) {
             flag_ad |= VTD_FS_D;
         }
 
-        if (vtd_set_flag_in_pte(addr, offset, fspte, flag_ad) != MEMTX_OK) {
+        if (vtd_set_flags_in_pte(addr, offset, fspte, flag_ad) != MEMTX_OK) {
             return -VTD_FR_FS_BIT_UPDATE_FAILED;
         }
 
@@ -3021,6 +3021,8 @@ static void vtd_piotlb_page_invalidate(IntelIOMMUState *s, uint16_t domain_id,
 {
     VTDIOTLBPageInvInfo info;
 
+    assert(am <= VTD_MAMV);
+
     info.domain_id = domain_id;
     info.pasid = pasid;
     info.addr = addr;
@@ -3060,6 +3062,13 @@ static bool vtd_process_piotlb_desc(IntelIOMMUState *s,
 
     case VTD_INV_DESC_PIOTLB_PSI_IN_PASID:
         am = VTD_INV_DESC_PIOTLB_AM(inv_desc->val[1]);
+        if (am > VTD_MAMV) {
+            error_report_once("%s: invalid piotlb inv desc: hi=0x%"PRIx64
+                              ", lo=0x%"PRIx64" (am=%u > VTD_MAMV=%llu)",
+                              __func__, inv_desc->val[1], inv_desc->val[0],
+                              am, VTD_MAMV);
+            return false;
+        }
         addr = (hwaddr) VTD_INV_DESC_PIOTLB_ADDR(inv_desc->val[1]);
         vtd_piotlb_page_invalidate(s, domain_id, pasid, addr, am,
                                    VTD_INV_DESC_PIOTLB_IH(inv_desc));
@@ -3618,15 +3627,26 @@ static void vtd_handle_iectl_write(IntelIOMMUState *s)
 
 static void vtd_handle_prs_write(IntelIOMMUState *s)
 {
-    uint32_t prs = vtd_get_long_raw(s, DMAR_PRS_REG);
+    uint32_t prs;
+
+    vtd_iommu_lock(s);
+
+    prs = vtd_get_long_raw(s, DMAR_PRS_REG);
     if (!(prs & VTD_PR_STATUS_PPR) && !(prs & VTD_PR_STATUS_PRO)) {
         vtd_set_clear_mask_long(s, DMAR_PECTL_REG, VTD_PR_PECTL_IP, 0);
     }
+
+    vtd_iommu_unlock(s);
 }
 
 static void vtd_handle_pectl_write(IntelIOMMUState *s)
 {
-    uint32_t pectl = vtd_get_long_raw(s, DMAR_PECTL_REG);
+    uint32_t pectl;
+
+    vtd_iommu_lock(s);
+
+    pectl = vtd_get_long_raw(s, DMAR_PECTL_REG);
+
     if ((pectl & VTD_PR_PECTL_IP) && !(pectl & VTD_PR_PECTL_IM)) {
         /*
          * If IP field was 1 when software clears the IM field,
@@ -3635,6 +3655,8 @@ static void vtd_handle_pectl_write(IntelIOMMUState *s)
         vtd_set_clear_mask_long(s, DMAR_PECTL_REG, VTD_PR_PECTL_IP, 0);
         vtd_generate_interrupt(s, DMAR_PEADDR_REG, DMAR_PEDATA_REG);
     }
+
+    vtd_iommu_unlock(s);
 }
 
 static uint64_t vtd_mem_read(void *opaque, hwaddr addr, unsigned size)
@@ -4988,7 +5010,7 @@ static void vtd_cap_init(IntelIOMMUState *s)
 {
     X86IOMMUState *x86_iommu = X86_IOMMU_DEVICE(s);
 
-    s->cap = VTD_CAP_FRO | VTD_CAP_NFR | VTD_CAP_ND | VTD_ECAP_PT |
+    s->cap = VTD_CAP_FRO | VTD_CAP_NFR | VTD_CAP_ND |
              VTD_CAP_MAMV | VTD_CAP_PSI | VTD_CAP_SSLPS | VTD_CAP_DRAIN |
              VTD_CAP_ESRTPS | VTD_CAP_MGAW(s->aw_bits);
     if (x86_iommu->dma_translation) {
@@ -4999,7 +5021,7 @@ static void vtd_cap_init(IntelIOMMUState *s)
                     s->cap |= VTD_CAP_SAGAW_48bit;
             }
     }
-    s->ecap = VTD_ECAP_QI | VTD_ECAP_IRO;
+    s->ecap = VTD_ECAP_QI | VTD_ECAP_IRO | VTD_ECAP_PT;
 
     if (x86_iommu_ir_supported(x86_iommu)) {
         s->ecap |= VTD_ECAP_IR | VTD_ECAP_MHMV;
@@ -5099,7 +5121,8 @@ static void vtd_init(IntelIOMMUState *s)
     }
 
     if (s->svm) {
-        s->ecap |= VTD_ECAP_PRS | VTD_ECAP_PDS | VTD_ECAP_NWFS;
+        s->ecap |= VTD_ECAP_PRS | VTD_ECAP_PDS | VTD_ECAP_NWFS |
+                   VTD_ECAP_SMPWCS;
     }
 
     vtd_reset_caches(s);
@@ -5368,19 +5391,18 @@ static int vtd_pri_request_page(PCIBus *bus, void *opaque, int devfn,
 {
     IntelIOMMUState *s = opaque;
     VTDAddressSpace *vtd_as;
+    uint64_t queue_addr_reg;
+    uint64_t queue_tail_offset_reg;
+    uint64_t new_queue_tail_offset;
+    uint64_t queue_head_offset_reg;
+    hwaddr queue_tail;
+    uint32_t old_pr_status;
+    uint16_t sid;
+    VTDPRDesc desc;
+    int ret = 0;
 
     vtd_as = vtd_find_add_as(s, bus, devfn, pasid);
-
-    uint64_t queue_addr_reg = vtd_get_quad(s, DMAR_PQA_REG);
-    uint64_t queue_tail_offset_reg = vtd_get_quad(s, DMAR_PQT_REG);
-    uint64_t new_queue_tail_offset = (
-                                (queue_tail_offset_reg + VTD_PQA_ENTRY_SIZE) %
-                                (vtd_prq_size(s) * VTD_PQA_ENTRY_SIZE));
-    uint64_t queue_head_offset_reg = vtd_get_quad(s, DMAR_PQH_REG);
-    hwaddr queue_tail = (queue_addr_reg & VTD_PQA_ADDR) + queue_tail_offset_reg;
-    uint32_t old_pr_status = vtd_get_long(s, DMAR_PRS_REG);
-    uint16_t sid = PCI_BUILD_BDF(pci_bus_num(vtd_as->bus), vtd_as->devfn);
-    VTDPRDesc desc;
+    sid = PCI_BUILD_BDF(pci_bus_num(vtd_as->bus), vtd_as->devfn);
 
     if (!(s->ecap & VTD_ECAP_PRS)) {
         return -EPERM;
@@ -5404,25 +5426,7 @@ static int vtd_pri_request_page(PCIBus *bus, void *opaque, int devfn,
         return -EPERM;
     }
 
-    if (old_pr_status & VTD_PR_STATUS_PRO) {
-        /*
-         * No action is taken by hardware to report a fault
-         * or generate an event
-         */
-        return -ENOSPC;
-    }
-
-    /* Check for overflow */
-    if (new_queue_tail_offset == queue_head_offset_reg) {
-        vtd_set_clear_mask_long(s, DMAR_PRS_REG, 0, VTD_PR_STATUS_PRO);
-        vtd_generate_page_request_event(s, old_pr_status);
-        return -ENOSPC;
-    }
-
-    if (vtd_pri_perform_implicit_invalidation(vtd_as, addr)) {
-        return -EINVAL;
-    }
-
+    /* Prepare the descriptor */
     desc.lo = VTD_PRD_TYPE | VTD_PRD_PP(true) | VTD_PRD_RID(sid) |
               VTD_PRD_PASID(vtd_as->pasid) | VTD_PRD_PMR(priv_req);
     desc.hi = VTD_PRD_RDR(is_read) | VTD_PRD_WRR(is_write) |
@@ -5430,26 +5434,55 @@ static int vtd_pri_request_page(PCIBus *bus, void *opaque, int devfn,
 
     desc.lo = cpu_to_le64(desc.lo);
     desc.hi = cpu_to_le64(desc.hi);
+
+    if (vtd_pri_perform_implicit_invalidation(vtd_as, addr)) {
+        return -EINVAL;
+    }
+
+    vtd_iommu_lock(s);
+
+    queue_addr_reg = vtd_get_quad(s, DMAR_PQA_REG);
+    queue_tail_offset_reg = vtd_get_quad(s, DMAR_PQT_REG);
+    new_queue_tail_offset = ((queue_tail_offset_reg + VTD_PQA_ENTRY_SIZE) %
+                            (vtd_prq_size(s) * VTD_PQA_ENTRY_SIZE));
+    queue_head_offset_reg = vtd_get_quad(s, DMAR_PQH_REG);
+    queue_tail = (queue_addr_reg & VTD_PQA_ADDR) + queue_tail_offset_reg;
+    old_pr_status = vtd_get_long(s, DMAR_PRS_REG);
+
+    if (old_pr_status & VTD_PR_STATUS_PRO) {
+        /*
+         * No action is taken by hardware to report a fault
+         * or generate an event
+         */
+        ret = -ENOSPC;
+        goto out;
+    }
+
+    /* Check for overflow */
+    if (new_queue_tail_offset == queue_head_offset_reg) {
+        vtd_set_clear_mask_long(s, DMAR_PRS_REG, 0, VTD_PR_STATUS_PRO);
+        vtd_generate_page_request_event(s, old_pr_status);
+        ret = -ENOSPC;
+        goto out;
+    }
+
     if (dma_memory_write(&address_space_memory, queue_tail, &desc, sizeof(desc),
                          MEMTXATTRS_UNSPECIFIED)) {
         error_report_once("IO error, the PQ tail cannot be updated");
-        return -EIO;
+        ret = -EIO;
+        goto out;
     }
 
     /* increment the tail register and set the pending request bit */
     vtd_set_quad(s, DMAR_PQT_REG, new_queue_tail_offset);
-    /*
-     * read status again so that the kernel does not miss a request.
-     * in some cases, we can trigger an unecessary interrupt but this strategy
-     * drastically improves performance as we don't need to take a lock.
-     */
-    old_pr_status = vtd_get_long(s, DMAR_PRS_REG);
     if (!(old_pr_status & VTD_PR_STATUS_PPR)) {
         vtd_set_clear_mask_long(s, DMAR_PRS_REG, 0, VTD_PR_STATUS_PPR);
         vtd_generate_page_request_event(s, old_pr_status);
     }
 
-    return 0;
+out:
+    vtd_iommu_unlock(s);
+    return ret;
 }
 
 static void vtd_init_iotlb_notifier(PCIBus *bus, void *opaque, int devfn,

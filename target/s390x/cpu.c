@@ -225,10 +225,12 @@ static void s390_cpu_reset_hold(Object *obj, ResetType type)
 static void s390_cpu_disas_set_info(const CPUState *cpu, disassemble_info *info)
 {
     info->mach = bfd_mach_s390_64;
-    info->cap_arch = CS_ARCH_SYSZ;
+    info->cap_arch = CS_ARCH_SYSTEMZ;
     info->endian = BFD_ENDIAN_BIG;
     info->cap_insn_unit = 2;
     info->cap_insn_split = 6;
+    /* Disassemble everything, even if the cpu would trap on the insn. */
+    info->cap_mode = CS_MODE_SYSTEMZ_ARCH14;
 }
 
 static void s390_cpu_realizefn(DeviceState *dev, Error **errp)
@@ -249,7 +251,7 @@ static void s390_cpu_realizefn(DeviceState *dev, Error **errp)
     }
 #endif
 
-    cpu_exec_realizefn(cs, &err);
+    cpu_common_realize(cs, &err);
     if (err != NULL) {
         goto out;
     }

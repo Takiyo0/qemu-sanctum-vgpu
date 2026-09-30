@@ -1,7 +1,7 @@
 # syntax = docker/dockerfile:1.5
 
-ARG EMSDK_VERSION_QEMU=4.0.10
-ARG ZLIB_VERSION=1.3.1
+ARG EMSDK_VERSION_QEMU=5.0.2
+ARG ZLIB_VERSION=1.3.2
 ARG GLIB_MINOR_VERSION=2.84
 ARG GLIB_VERSION=${GLIB_MINOR_VERSION}.0
 ARG PIXMAN_VERSION=0.44.2
@@ -19,13 +19,15 @@ ENV CXXFLAGS="$CFLAGS"
 ENV LDFLAGS="-sWASM_BIGINT -sASYNCIFY=1 -L$TARGET/lib"
 RUN apt-get update && apt-get install -y \
     autoconf \
+    bison \
     build-essential \
+    flex \
     libglib2.0-dev \
     libtool \
     pkgconf \
     ninja-build \
     python3-pip
-RUN pip3 install meson==${MESON_VERSION} tomli
+RUN pip3 install --break-system-packages meson==${MESON_VERSION} tomli
 RUN mkdir /build
 WORKDIR /build
 RUN mkdir -p $TARGET

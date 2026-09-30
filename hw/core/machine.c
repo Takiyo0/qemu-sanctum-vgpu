@@ -40,14 +40,23 @@
 #include "qemu/audio.h"
 #include "hw/arm/smmuv3.h"
 
+GlobalProperty hw_compat_11_1[] = {
+    { "sysbus-ehci-usb", "x-migrate-fetch-addr-64bit", "off" },
+    { "pci-ehci-usb", "x-migrate-fetch-addr-64bit", "off" },
+};
+const size_t hw_compat_11_1_len = G_N_ELEMENTS(hw_compat_11_1);
+
 GlobalProperty hw_compat_11_0[] = {
+    { "virtio-mmio", VIRTIO_QUEUE_SIZE_OVERRIDE, "1024" },
     { "chardev-vc", "encoding", "cp437" },
     { "tpm-crb", "cap-chunk", "off" },
     { "tpm-crb", "x-allow-chunk-migration", "off" },
+    { "tpm-tis-device", "ppi", "off" },
     { TYPE_ARM_SMMUV3, "ats", "off" },
     { TYPE_ARM_SMMUV3, "ril", "on" },
     { TYPE_ARM_SMMUV3, "ssidsize", "0" },
     { TYPE_ARM_SMMUV3, "oas", "44" },
+    { "migration", "switchover-ack-legacy", "on" },
 };
 const size_t hw_compat_11_0_len = G_N_ELEMENTS(hw_compat_11_0);
 
@@ -496,6 +505,8 @@ static void machine_set_memory_encryption(Object *obj, const char *value,
 {
     Object *cgs =
         object_resolve_path_component(object_get_objects_root(), value);
+
+    warn_report("memory-encryption is deprecated, use confidential-guest-support instead");
 
     if (!cgs) {
         error_setg(errp, "No such memory encryption object '%s'", value);
@@ -1303,6 +1314,7 @@ static void machine_finalize(Object *obj)
     g_free(ms->nvdimms_state);
     g_free(ms->numa_state);
     g_free(ms->audiodev);
+    g_free(ms->fdt);
 }
 
 bool machine_usb(MachineState *machine)
@@ -1613,14 +1625,6 @@ void machine_run_board_init(MachineState *machine, const char *mem_path, Error *
        reading from the other reads, because timer polling functions query
        clock values from the log. */
     replay_checkpoint(CHECKPOINT_INIT);
-
-    if (!xen_enabled()) {
-        /* On 32-bit hosts, QEMU is limited by virtual address space */
-        if (machine->ram_size > (2047 << 20) && HOST_LONG_BITS == 32) {
-            error_setg(errp, "at most 2047 MB RAM can be simulated");
-            return;
-        }
-    }
 
     if (machine->memdev) {
         ram_addr_t backend_size = object_property_get_uint(OBJECT(machine->memdev),

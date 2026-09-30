@@ -11,7 +11,6 @@
 #include "migration/qemu-file-types.h"
 #include "migration/vmstate.h"
 #include "target/arm/gtimer.h"
-#include "hw/arm/machines-qom.h"
 
 static bool vfp_needed(void *opaque)
 {
@@ -585,7 +584,8 @@ static bool pmsav7_needed(void *opaque)
     CPUARMState *env = &cpu->env;
 
     return arm_feature(env, ARM_FEATURE_PMSA) &&
-           arm_feature(env, ARM_FEATURE_V7) &&
+           (arm_feature(env, ARM_FEATURE_V7) ||
+            arm_feature(env, ARM_FEATURE_M)) &&
            !arm_feature(env, ARM_FEATURE_V8);
 }
 
@@ -1345,21 +1345,4 @@ const VMStateDescription vmstate_arm_cpu = {
         &vmstate_fpmr,
         NULL
     }
-};
-
-const InterfaceInfo arm_machine_interfaces[] = {
-    { TYPE_TARGET_ARM_MACHINE },
-    { TYPE_TARGET_AARCH64_MACHINE },
-    { }
-};
-
-const InterfaceInfo arm_aarch64_machine_interfaces[] = {
-    { TYPE_TARGET_ARM_MACHINE },
-    { TYPE_TARGET_AARCH64_MACHINE },
-    { }
-};
-
-const InterfaceInfo aarch64_machine_interfaces[] = {
-    { TYPE_TARGET_AARCH64_MACHINE },
-    { }
 };

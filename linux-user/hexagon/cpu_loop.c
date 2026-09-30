@@ -22,6 +22,7 @@
 #include "qemu.h"
 #include "user-internals.h"
 #include "user/cpu_loop.h"
+#include "target/hexagon/internal.h"
 #include "signal-common.h"
 #include "internal.h"
 
@@ -60,14 +61,33 @@ void cpu_loop(CPUHexagonState *env)
                 env->gpr[0] = ret;
             }
             break;
-        case HEX_CAUSE_PC_NOT_ALIGNED:
-            force_sig_fault(TARGET_SIGBUS, TARGET_BUS_ADRALN,
-                            env->gpr[HEX_REG_R31]);
-            break;
-        case HEX_CAUSE_INVALID_PACKET:
-        case HEX_CAUSE_REG_WRITE_CONFLICT:
-            force_sig_fault(TARGET_SIGILL, TARGET_ILL_ILLOPC,
-                            env->gpr[HEX_REG_PC]);
+        case HEX_EVENT_PRECISE:
+            switch (env->cause_code) {
+            case HEX_CAUSE_FETCH_NO_UPAGE:
+            case HEX_CAUSE_PRIV_NO_UREAD:
+            case HEX_CAUSE_PRIV_NO_UWRITE:
+                force_sig_fault(TARGET_SIGSEGV, TARGET_SEGV_MAPERR,
+                                env->gpr[HEX_REG_PC]);
+                break;
+            case HEX_CAUSE_PRIV_USER_NO_GINSN:
+            case HEX_CAUSE_PRIV_USER_NO_SINSN:
+            case HEX_CAUSE_INVALID_PACKET:
+            case HEX_CAUSE_REG_WRITE_CONFLICT:
+                force_sig_fault(TARGET_SIGILL, TARGET_ILL_ILLOPC,
+                                env->gpr[HEX_REG_PC]);
+                break;
+            case HEX_CAUSE_MISALIGNED_LOAD:
+            case HEX_CAUSE_MISALIGNED_STORE:
+            case HEX_CAUSE_PC_NOT_ALIGNED:
+                force_sig_fault(TARGET_SIGBUS, TARGET_BUS_ADRALN,
+                                env->gpr[HEX_REG_PC]);
+                break;
+            default:
+                EXCP_DUMP(env, "\nqemu: unhandled CPU precise exception "
+                    "cause code 0x%x - aborting\n",
+                    env->cause_code);
+                exit(EXIT_FAILURE);
+            }
             break;
         case EXCP_ATOMIC:
             cpu_exec_step_atomic(cs);

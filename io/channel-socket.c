@@ -667,7 +667,7 @@ static ssize_t qio_channel_socket_writev(QIOChannel *ioc,
 
  retry:
     ret = sendmsg(sioc->fd, &msg, sflags);
-    if (ret <= 0) {
+    if (ret < 0) {
         switch (errno) {
         case EAGAIN:
             return QIO_CHANNEL_ERR_BLOCK;
@@ -946,6 +946,12 @@ qio_channel_socket_set_cork(QIOChannel *ioc,
     QIOChannelSocket *sioc = QIO_CHANNEL_SOCKET(ioc);
     int v = enabled ? 1 : 0;
 
+    /*
+     * We can ignore the error return from socket_set_cork() because
+     * at the QIO API level set_cork is only a hint, and so
+     * qio_channel_set_cork() can never fail even if it didn't
+     * actually do anything.
+     */
     socket_set_cork(sioc->fd, v);
 }
 

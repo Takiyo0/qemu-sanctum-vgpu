@@ -10,6 +10,7 @@
 #include "qom/object.h"
 #include "hw/core/hotplug.h"
 #include "hw/core/resettable.h"
+#include "monitor/hmp.h"
 
 /**
  * DOC: The QEMU Device API
@@ -322,8 +323,10 @@ DECLARE_OBJ_CHECKERS(BusState, BusClass,
 struct BusClass {
     ObjectClass parent_class;
 
+#ifdef CONFIG_HMP
     /* FIXME first arg should be BusState */
-    void (*print_dev)(Monitor *mon, DeviceState *dev, int indent);
+    void (*print_dev)(MonitorHMP *mon, DeviceState *dev, int indent);
+#endif
     /*
      * Return a newly allocated string containing the path of the
      * device on this bus.
@@ -383,7 +386,7 @@ struct BusState {
     /* public: */
     DeviceState *parent;
     char *name;
-    HotplugHandler *hotplug_handler;
+    const HotplugHandler *hotplug_handler;
     int max_index;
     bool realized;
     bool full;
@@ -437,7 +440,7 @@ DeviceState *qdev_try_new(const char *name);
  * Context: May be called outside big qemu lock.
  * Return: true if the device has been fully constructed, false otherwise.
  */
-static inline bool qdev_is_realized(DeviceState *dev)
+static inline bool qdev_is_realized(const DeviceState *dev)
 {
     return qatomic_load_acquire(&dev->realized);
 }
@@ -511,8 +514,8 @@ bool qdev_realize_and_unref(DeviceState *dev, BusState *bus, Error **errp);
 void qdev_unrealize(DeviceState *dev);
 void qdev_set_legacy_instance_id(DeviceState *dev, int alias_id,
                                  int required_for_version);
-HotplugHandler *qdev_get_bus_hotplug_handler(DeviceState *dev);
-HotplugHandler *qdev_get_machine_hotplug_handler(DeviceState *dev);
+const HotplugHandler *qdev_get_bus_hotplug_handler(DeviceState *dev);
+const HotplugHandler *qdev_get_machine_hotplug_handler(DeviceState *dev);
 bool qdev_hotplug_allowed(DeviceState *dev, BusState *bus, Error **errp);
 bool qdev_hotunplug_allowed(DeviceState *dev, Error **errp);
 
@@ -526,10 +529,10 @@ bool qdev_hotunplug_allowed(DeviceState *dev, Error **errp);
  * Return: pointer to object that implements TYPE_HOTPLUG_HANDLER interface
  * or NULL if there aren't any.
  */
-HotplugHandler *qdev_get_hotplug_handler(DeviceState *dev);
+const HotplugHandler *qdev_get_hotplug_handler(DeviceState *dev);
 void qdev_unplug(DeviceState *dev, Error **errp);
 int qdev_sync_config(DeviceState *dev, Error **errp);
-void qdev_simple_device_unplug_cb(HotplugHandler *hotplug_dev,
+void qdev_simple_device_unplug_cb(const HotplugHandler *hotplug_dev,
                                   DeviceState *dev, Error **errp);
 void qdev_machine_creation_done(void);
 bool qdev_machine_modified(void);
@@ -1062,11 +1065,11 @@ void qbus_set_bus_hotplug_handler(BusState *bus);
 
 static inline bool qbus_is_hotpluggable(BusState *bus)
 {
-    HotplugHandler *plug_handler = bus->hotplug_handler;
+    const HotplugHandler *plug_handler = bus->hotplug_handler;
     bool ret = !!plug_handler;
 
     if (plug_handler) {
-        HotplugHandlerClass *hdc;
+        const HotplugHandlerClass *hdc;
 
         hdc = HOTPLUG_HANDLER_GET_CLASS(plug_handler);
         if (hdc->is_hotpluggable_bus) {
