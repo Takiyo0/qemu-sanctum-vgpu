@@ -15,6 +15,15 @@ def destdir_join(d1: str, d2: str) -> str:
     return str(PurePath(d1, *PurePath(d2).parts[1:]))
 
 introspect = os.environ.get('MESONINTROSPECT')
+
+# The qemu-bundle/ symlink tree is an install/run convenience layout only; the
+# build does not depend on it. On Windows os.symlink needs Developer Mode/admin
+# and the introspected install destinations are prefix-relative (not real files
+# to copy), so skip the bundle entirely here. (Local E1 build experiment edit;
+# POSIX behavior below is unchanged.)
+if os.name == 'nt':
+    sys.exit(0)
+
 out = subprocess.run([*shlex.split(introspect), '--installed'],
                      stdout=subprocess.PIPE, check=True).stdout
 for source, dest in json.loads(out).items():

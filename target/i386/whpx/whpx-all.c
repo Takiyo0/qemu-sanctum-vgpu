@@ -1031,6 +1031,99 @@ static int whpx_handle_mmio(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
     WHV_MEMORY_ACCESS_CONTEXT *ctx = &exit_ctx->MemoryAccess;
     int ret;
 
+    /*
+     * Classify the memory-access exit before blindly emulating it as MMIO.
+     *
+     * WHPX raises WHvRunVpExitReasonMemoryAccess for two very different cases:
+     *   (a) GpaUnmapped == 1: the guest touched a GPA with no backing mapping.
+     *       This is a genuine device-MMIO access (or truly unbacked), and
+     *       instruction emulation against the QEMU memory model is correct.
+     *   (b) GpaUnmapped == 0: the GPA *is* mapped as RAM, but the access
+     *       violated the permissions WHPX established for that mapping (e.g. a
+     *       write to a read-only / copy-on-write page). This is a protection
+     *       fault that belongs to the GUEST's own page-fault handler, NOT MMIO.
+     *
+     * The upstream code emulated (b) as MMIO, which silently produces a wrong
+     * result for RAM addresses. XNU's dyld shared-region setup relies on taking
+     * such protection faults and resolving them itself (shared submap / COW);
+     * emulating-as-MMIO is what makes vm_shared_region_start_address() return
+     * 0x1 and launchd fail to map libSystem. Reflect the fault to the guest
+     * instead so XNU's VM fault path runs.
+     */
+    if (!ctx->AccessInfo.GpaUnmapped) {
+        X86CPU *x86_cpu = X86_CPU(cpu);
+        CPUX86State *env = &x86_cpu->env;
+        uint64_t error_code;
+        hwaddr xlat = 0, plen = 1;
+        MemoryRegion *mr;
+        bool gpa_is_ram;
+
+        /*
+         * GpaUnmapped==0 is necessary but NOT sufficient to call this a RAM
+         * protection fault: a registered DEVICE/MMIO region also reports
+         * GpaUnmapped==0. OVMF firmware performs plenty of such MMIO accesses
+         * (VGA, etc.) very early, before any guest #PF handler exists --
+         * injecting a #PF for those wedges the firmware at the TianoCore splash.
+         * So confirm the faulting GPA actually resolves to guest RAM before
+         * reflecting the fault; otherwise fall through to MMIO emulation.
+         */
+        mr = address_space_translate(&address_space_memory, ctx->Gpa,
+                                     &xlat, &plen, false,
+                                     MEMTXATTRS_UNSPECIFIED);
+        gpa_is_ram = mr && memory_region_is_ram(mr);
+
+        /* --- DIAGNOSTIC: log the first 40 RAM-branch faults then go quiet. --- */
+        {
+            static int whpx_pf_diag_count;
+            if (whpx_pf_diag_count < 40) {
+                whpx_pf_diag_count++;
+                error_report("WHPX-PFDIAG #%d: Gpa=0x%016llx Gva=0x%016llx "
+                    "AccessType=%u(0=r,1=w,2=x) GpaUnmapped=%u GvaValid=%u "
+                    "Cpl=%u gpa_is_ram=%d mr=%s ro=%d romd=%d",
+                    whpx_pf_diag_count,
+                    (unsigned long long)ctx->Gpa,
+                    (unsigned long long)ctx->Gva,
+                    (unsigned)ctx->AccessInfo.AccessType,
+                    (unsigned)ctx->AccessInfo.GpaUnmapped,
+                    (unsigned)ctx->AccessInfo.GvaValid,
+                    (unsigned)cpu->accel->exit_ctx.VpContext.ExecutionState.Cpl,
+                    (int)gpa_is_ram,
+                    mr ? memory_region_name(mr) : "(none)",
+                    mr ? (int)mr->readonly : -1,
+                    mr ? (int)mr->rom_device : -1);
+            }
+        }
+
+        if (gpa_is_ram) {
+            /* The faulting page IS present (mapped) -> P bit set. */
+            error_code = PG_ERROR_P_MASK;
+            if (ctx->AccessInfo.AccessType == WHvMemoryAccessWrite) {
+                error_code |= PG_ERROR_W_MASK;
+            }
+            if (ctx->AccessInfo.AccessType == WHvMemoryAccessExecute) {
+                error_code |= PG_ERROR_I_D_MASK;
+            }
+            /* CPL==3 -> user-mode fault (U/S bit). Inlined to avoid a fwd ref. */
+            if (cpu->accel->exit_ctx.VpContext.ExecutionState.Cpl == 3) {
+                error_code |= PG_ERROR_U_MASK;
+            }
+            /* CR2 = faulting linear address, when WHPX gave us a valid GVA. */
+            if (ctx->AccessInfo.GvaValid) {
+                env->cr[2] = ctx->Gva;
+            }
+
+            env->exception_nr = EXCP0E_PAGE;
+            env->exception_injected = 1;
+            env->has_error_code = 1;
+            env->error_code = error_code;
+            env->exception_has_payload = 0;
+            env->exception_is_int = 0;
+            /* Injected on the next whpx_inject_exceptions() before re-entry. */
+            return 0;
+        }
+        /* Not RAM (device/MMIO) -> fall through to emulation below. */
+    }
+
     ret = emulate_instruction(cpu, ctx->InstructionBytes, ctx->InstructionByteCount);
     if (ret < 0) {
         error_report("failed to emulate mmio");
@@ -2680,8 +2773,45 @@ int whpx_vcpu_run(CPUState *cpu)
 
             ret = 1;
             break;
+        case WHvRunVpExitReasonUnrecoverableException: {
+            /* --- DIAGNOSTIC: dump the VP context at the unrecoverable exit. --- */
+            WHV_VP_EXIT_CONTEXT *vc = &vcpu->exit_ctx.VpContext;
+            error_report("WHPX-UNRECOVERABLE: RIP=0x%016llx CS=0x%04x "
+                "Cpl=%u InstrLen=%u Cr8=%u Rflags=0x%016llx "
+                "intr_pending=%u intr_shadow=%u",
+                (unsigned long long)vc->Rip,
+                (unsigned)vc->Cs.Selector,
+                (unsigned)vc->ExecutionState.Cpl,
+                (unsigned)vc->InstructionLength,
+                (unsigned)vc->Cr8,
+                (unsigned long long)vc->Rflags,
+                (unsigned)vc->ExecutionState.InterruptionPending,
+                (unsigned)vc->ExecutionState.InterruptShadow);
+            /* Pull CR2/CR3 + GPRs via the register read for context. */
+            whpx_get_registers(cpu, WHPX_LEVEL_FULL_STATE);
+            {
+                X86CPU *x86_cpu = X86_CPU(cpu);
+                CPUX86State *env = &x86_cpu->env;
+                error_report("WHPX-UNRECOVERABLE regs: CR2=0x%016llx CR3=0x%016llx "
+                    "RAX=0x%016llx RBX=0x%016llx RCX=0x%016llx RDX=0x%016llx "
+                    "RSI=0x%016llx RDI=0x%016llx RSP=0x%016llx RBP=0x%016llx",
+                    (unsigned long long)env->cr[2],
+                    (unsigned long long)env->cr[3],
+                    (unsigned long long)env->regs[R_EAX],
+                    (unsigned long long)env->regs[R_EBX],
+                    (unsigned long long)env->regs[R_ECX],
+                    (unsigned long long)env->regs[R_EDX],
+                    (unsigned long long)env->regs[R_ESI],
+                    (unsigned long long)env->regs[R_EDI],
+                    (unsigned long long)env->regs[R_ESP],
+                    (unsigned long long)env->regs[R_EBP]);
+            }
+            bql_lock();
+            vm_stop(RUN_STATE_PAUSED);
+            bql_unlock();
+            break;
+        }
         case WHvRunVpExitReasonNone:
-        case WHvRunVpExitReasonUnrecoverableException:
         case WHvRunVpExitReasonInvalidVpRegisterValue:
         case WHvRunVpExitReasonUnsupportedFeature:
         default:

@@ -879,7 +879,7 @@ endif
 # xtask dist` writes into its target/dist/lib/pkgconfig. It is linked
 # statically, so the binary records no path to it. The library runs on
 # macOS, under HVF, and on Linux, under KVM.
-if host_os in ['darwin', 'linux']
+if host_os in ['darwin', 'linux', 'windows']
   pvg = dependency('reims-vgpu', method: 'pkg-config', static: true,
                    required: get_option('pvg'))
   # apple-gfx-pci's default romfile: the EFI option ROM the package's
@@ -3424,7 +3424,8 @@ foreach target : target_dirs
     # figure out which target can support PVG on this host: HVF's on macOS,
     # KVM's on Linux.
     if pvg.found() and (target in accelerator_targets.get('CONFIG_HVF', []) or
-                        target in accelerator_targets.get('CONFIG_KVM', []))
+                        target in accelerator_targets.get('CONFIG_KVM', []) or
+                        target in accelerator_targets.get('CONFIG_WHPX', []))
       target_kconfig += 'CONFIG_MAC_PVG=y'
     endif
 

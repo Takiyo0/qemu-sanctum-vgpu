@@ -1650,7 +1650,7 @@ def main():
 
     if output_file:
         output_fd.close()
-    exit(1 if testforerror else 0)
+    sys.exit(1 if testforerror else 0)
 # end main
 
 

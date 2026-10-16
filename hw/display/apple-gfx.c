@@ -84,13 +84,79 @@ static int apple_gfx_do_render(void *opaque)
         rvg_frame_commit(frame);
         rvg_frame_wait(frame);
         rvg_frame_release(frame);
-        job->pixels = g_malloc(stride * job->height);
+        job->pixels = g_malloc0(stride * job->height);
         status = rvg_frame_target_read_pixels(job->target, job->pixels, stride,
                                               stride * job->height);
         if (status != RVG_OK) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "%s: rvg_frame_target_read_pixels: %s\n", __func__,
                           rvg_status_message(status));
+        } else if (getenv("REIMS_VGPU_PROBE_TARGET")) {
+            /* DIAG: coverage %, the centre pixel, and whether it changes
+             * frame to frame — a live full desktop vs a static sliver. */
+            size_t total = stride * (size_t)job->height;
+            size_t i, nz = 0;
+            static uint64_t probe_frame = 0;
+            static uint64_t last_hash = 0;
+            uint64_t probe_frame_number = ++probe_frame;
+            uint64_t hash = UINT64_C(14695981039346656037);
+            for (i = 0; i < total; i++) {
+                if (job->pixels[i] != 0) {
+                    nz++;
+                }
+                hash ^= job->pixels[i];
+                hash *= UINT64_C(1099511628211);
+            }
+            size_t cx = job->width / 2, cy = job->height / 2;
+            size_t ci = cy * stride + cx * 4;
+            static uint32_t last_center = 0xdeadbeef;
+            uint32_t center = *(uint32_t *)(job->pixels + ci);
+            double pct = 100.0 * (double)nz / (double)total;
+            fprintf(stderr, "DIAG probe-target #%" PRIu64 ": %ux%u coverage=%.1f%% "
+                    "hash=%016" PRIx64 " %s centre(%zu,%zu)=BGRA(%u,%u,%u,%u) %s\n",
+                    probe_frame_number,
+                    job->width, job->height, pct,
+                    hash, hash == last_hash ? "UNCHANGED" : "CHANGED", cx, cy,
+                    job->pixels[ci + 0], job->pixels[ci + 1],
+                    job->pixels[ci + 2], job->pixels[ci + 3],
+                    center == last_center ? "UNCHANGED" : "CHANGED");
+            last_hash = hash;
+            last_center = center;
+            /* Save the latest frame continuously */
+            if (1) {
+                FILE *latest_fp = fopen("C:\\Users\\takiyo\\Documents\\macos\\qemu-vm\\target-frame-latest.ppm", "wb");
+                if (latest_fp) {
+                    fprintf(latest_fp, "P6\n%u %u\n255\n", job->width, job->height);
+                    for (size_t p = 0; p < (size_t)job->width * job->height; p++) {
+                        uint8_t b = job->pixels[p*4+0];
+                        uint8_t g = job->pixels[p*4+1];
+                        uint8_t r = job->pixels[p*4+2];
+                        fputc(r, latest_fp); fputc(g, latest_fp); fputc(b, latest_fp);
+                    }
+                    fclose(latest_fp);
+                }
+            }
+            if (probe_frame_number == 1 || probe_frame_number == 30 ||
+                probe_frame_number == 300 || (probe_frame_number % 50 == 0)) {
+                char path[256];
+                snprintf(path, sizeof(path),
+                         "C:\\Users\\takiyo\\Documents\\macos\\qemu-vm\\target-frame-%03" PRIu64 ".ppm",
+                         probe_frame_number);
+                FILE *fp = fopen(path, "wb");
+                if (fp) {
+                    fprintf(fp, "P6\n%u %u\n255\n", job->width, job->height);
+                    for (size_t p = 0; p < (size_t)job->width * job->height; p++) {
+                        uint8_t b = job->pixels[p*4+0];
+                        uint8_t g = job->pixels[p*4+1];
+                        uint8_t r = job->pixels[p*4+2];
+                        fputc(r, fp); fputc(g, fp); fputc(b, fp);
+                    }
+                    fclose(fp);
+                    fprintf(stderr, "DIAG probe-target: wrote frame %" PRIu64
+                            " hash=%016" PRIx64 " to target-frame-%03" PRIu64 ".ppm\n",
+                            probe_frame_number, hash, probe_frame_number);
+                }
+            }
         }
     } else {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: rvg_display_encode_frame: %s\n",
@@ -116,6 +182,11 @@ static int apple_gfx_do_render(void *opaque)
  */
 static bool apple_gfx_watched(AppleGFXDisplay *d)
 {
+    /* DIAG: force the encode+readback path on so the content probe runs even
+     * with a native window (which otherwise suppresses this path). */
+    if (getenv("REIMS_VGPU_PROBE_TARGET")) {
+        return true;
+    }
     return !d->state->window &&
            qemu_clock_get_ms(QEMU_CLOCK_REALTIME) < d->watched_until_ms;
 }
@@ -251,6 +322,8 @@ static void set_mode(AppleGFXDisplay *d, uint32_t width, uint32_t height)
     d->target = NULL;
 
     d->surface = qemu_create_displaysurface(width, height);
+    memset(surface_data(d->surface), 0,
+           (size_t)surface_stride(d->surface) * (size_t)surface_height(d->surface));
     /* The new surface is blank until a render draws the current frame. */
     d->frame_dirty = true;
 
@@ -496,6 +569,19 @@ static void apple_gfx_event_push(AppleGFXEvent *event)
     AppleGFXState *s = event->d->state;
 
     WITH_QEMU_LOCK_GUARD(&s->event_lock) {
+        if (event->kind == APPLE_GFX_EVENT_POINTER) {
+            AppleGFXEvent *last = QSIMPLEQ_LAST(&s->events, AppleGFXEvent, next);
+            if (last && last->kind == APPLE_GFX_EVENT_POINTER &&
+                last->d == event->d &&
+                last->pointer.buttons == event->pointer.buttons) {
+                last->pointer.x = event->pointer.x;
+                last->pointer.y = event->pointer.y;
+                last->pointer.width = event->pointer.width;
+                last->pointer.height = event->pointer.height;
+                g_free(event);
+                return;
+            }
+        }
         QSIMPLEQ_INSERT_TAIL(&s->events, event, next);
     }
     qemu_bh_schedule(s->event_bh);
