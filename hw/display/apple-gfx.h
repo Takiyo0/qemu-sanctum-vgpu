@@ -33,6 +33,9 @@ typedef struct AppleGFXDisplay {
     /* Initialised on realize() */
     AppleGFXState *state;
     RvgDisplay *pgdisp;
+    uint32_t generation;
+    uint32_t serial;
+    bool keys[256];
     QemuConsole *con;
 
     /* Mutable state (BQL protected) */
@@ -67,6 +70,8 @@ struct AppleGFXState {
     ThreadPool *pool;
     AppleGFXDisplayMode *display_modes;
     uint32_t num_display_modes;
+    DeviceState *owner;
+    uint32_t display_ports;
     uint32_t num_displays; /* 1 to RVG_MAX_DISPLAY_PORTS, on ports 0 up */
     /*
      * The mode a window display offers the guest first: "<width>x<height>",

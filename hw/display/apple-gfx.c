@@ -20,6 +20,8 @@
 #include "qemu/main-loop.h"
 #include "qemu/timer.h"
 #include "qapi/visitor.h"
+#include "qapi/qapi-events-ui.h"
+#include "qom/object.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-ui.h"
 #include "system/address-spaces.h"
@@ -42,6 +44,27 @@ static const AppleGFXDisplayMode apple_gfx_default_modes[] = {
 static Error *apple_gfx_mig_blocker;
 static uint32_t next_pgdisplay_serial_num = 1;
 
+/* Callback contexts outlive queued work and identify one connection. */
+typedef struct AppleGFXCallback {
+    AppleGFXDisplay *d;
+    uint32_t generation;
+    int refs;
+} AppleGFXCallback;
+
+static bool apple_gfx_set_count(AppleGFXState *s, uint32_t count, Error **errp);
+static void apple_gfx_get_count(Object *obj, Visitor *v, const char *name,
+                                void *opaque, Error **errp);
+static void apple_gfx_put_count(Object *obj, Visitor *v, const char *name,
+                                void *opaque, Error **errp);
+
+static void apple_gfx_callback_destroy(void *opaque)
+{
+    AppleGFXCallback *ctx = opaque;
+    if (g_atomic_int_dec_and_test(&ctx->refs)) {
+        g_free(ctx);
+    }
+}
+
 /* ------ Rendering and frame management ------ */
 
 /*
@@ -52,6 +75,8 @@ static uint32_t next_pgdisplay_serial_num = 1;
 typedef struct AppleGFXRenderJob {
     AppleGFXDisplay *d;
     RvgFrameTarget *target;
+    RvgDisplay *display;
+    uint32_t generation;
     /* The surface's size when the render started, which the target has. */
     uint32_t width;
     uint32_t height;
@@ -76,7 +101,7 @@ static int apple_gfx_do_render(void *opaque)
      * of the target's pixels runs here too, so that a slow one never holds
      * the main loop, and with it the guest's other devices.
      */
-    status = rvg_display_encode_frame(job->d->pgdisp, job->target, NULL,
+    status = rvg_display_encode_frame(job->display, job->target, NULL,
                                       &frame);
     if (status == RVG_OK) {
         size_t stride = (size_t)job->width * 4;
@@ -204,7 +229,7 @@ static bool apple_gfx_render_new_frame(AppleGFXDisplay *d)
     if (d->rendering) {
         return true;
     }
-    if (!d->frame_dirty || d->surface == NULL || d->target == NULL) {
+    if (!d->pgdisp || !d->frame_dirty || d->surface == NULL || d->target == NULL) {
         return false;
     }
     d->frame_dirty = false;
@@ -212,6 +237,8 @@ static bool apple_gfx_render_new_frame(AppleGFXDisplay *d)
 
     job = g_new0(AppleGFXRenderJob, 1);
     job->d = d;
+    job->generation = d->generation;
+    job->display = d->pgdisp;
     job->target = rvg_frame_target_retain(d->target);
     job->width = surface_width(d->surface);
     job->height = surface_height(d->surface);
@@ -231,7 +258,7 @@ static void apple_gfx_render_frame_completed_bh(void *opaque)
     d->rendering = false;
 
     /* Only update display if mode hasn't changed since we started rendering. */
-    if (job->encoded &&
+    if (d->pgdisp && job->generation == d->generation && job->encoded &&
         job->width == surface_width(surface) &&
         job->height == surface_height(surface)) {
         size_t stride = (size_t)job->width * 4;
@@ -505,6 +532,9 @@ static void apple_gfx_input_key(AppleGFXDisplay *d, uint16_t usage,
      * between them, which a person's keys, far apart, do not need to fit the
      * USB keyboard's queue of 16 scancodes.
      */
+    if (usage < ARRAY_SIZE(d->keys)) {
+        d->keys[usage] = down;
+    }
     qemu_input_event_send_key_linux(d->con, lnx, down);
 }
 
@@ -525,12 +555,15 @@ typedef enum AppleGFXEventKind {
     APPLE_GFX_EVENT_SCROLL,
     APPLE_GFX_EVENT_KEY,
     APPLE_GFX_EVENT_CLOSE,
+    APPLE_GFX_EVENT_MODE,
+    APPLE_GFX_EVENT_FRAME,
 } AppleGFXEventKind;
 
 struct AppleGFXEvent {
     QSIMPLEQ_ENTRY(AppleGFXEvent) next;
     AppleGFXDisplay *d;
     AppleGFXEventKind kind;
+    uint32_t generation;
     union {
         AppleGFXCursorGlyph glyph;
         bool show;
@@ -549,12 +582,13 @@ struct AppleGFXEvent {
     };
 };
 
-static AppleGFXEvent *apple_gfx_event_new(AppleGFXDisplay *d,
+static AppleGFXEvent *apple_gfx_event_new(AppleGFXCallback *ctx,
                                           AppleGFXEventKind kind)
 {
     AppleGFXEvent *event = g_new0(AppleGFXEvent, 1);
 
-    event->d = d;
+    event->d = ctx->d;
+    event->generation = ctx->generation;
     event->kind = kind;
     return event;
 }
@@ -573,6 +607,7 @@ static void apple_gfx_event_push(AppleGFXEvent *event)
             AppleGFXEvent *last = QSIMPLEQ_LAST(&s->events, AppleGFXEvent, next);
             if (last && last->kind == APPLE_GFX_EVENT_POINTER &&
                 last->d == event->d &&
+                last->generation == event->generation &&
                 last->pointer.buttons == event->pointer.buttons) {
                 last->pointer.x = event->pointer.x;
                 last->pointer.y = event->pointer.y;
@@ -591,7 +626,19 @@ static void apple_gfx_event_run(AppleGFXEvent *event)
 {
     AppleGFXDisplay *d = event->d;
 
+    if (!d->pgdisp || event->generation != d->generation) {
+        if (event->kind == APPLE_GFX_EVENT_CURSOR_GLYPH) {
+            g_free(event->glyph.rgba);
+        }
+        return;
+    }
     switch (event->kind) {
+    case APPLE_GFX_EVENT_MODE:
+        set_mode(d, event->pointer.width, event->pointer.height);
+        break;
+    case APPLE_GFX_EVENT_FRAME:
+        new_frame_handler_bh(d);
+        break;
     case APPLE_GFX_EVENT_CURSOR_GLYPH:
         set_cursor_glyph(d, &event->glyph);
         g_free(event->glyph.rgba);
@@ -615,7 +662,14 @@ static void apple_gfx_event_run(AppleGFXEvent *event)
         apple_gfx_input_key(d, event->key.usage, event->key.down);
         break;
     case APPLE_GFX_EVENT_CLOSE:
-        apple_gfx_input_close();
+        if (d == &d->state->displays[0]) {
+            apple_gfx_input_close();
+        } else {
+            Error *err = NULL;
+            if (!apple_gfx_set_count(d->state, d - d->state->displays, &err)) {
+                error_report_err(err);
+            }
+        }
         break;
     default:
         g_assert_not_reached();
@@ -693,6 +747,8 @@ static const MemoryRegionOps apple_gfx_ops = {
 
 void apple_gfx_common_init(Object *obj, AppleGFXState *s, const char *obj_name)
 {
+    object_property_add(obj, "display-count", "uint32",
+                        apple_gfx_get_count, apple_gfx_put_count, NULL, s);
     trace_apple_gfx_common_init(obj_name, RVG_DEVICE_MMIO_SIZE);
     memory_region_init_io(&s->iomem_gfx, obj, &apple_gfx_ops, s, obj_name,
                           RVG_DEVICE_MMIO_SIZE);
@@ -828,31 +884,21 @@ static bool apple_gfx_memory_files(GArray *ranges, GArray *files,
  */
 static void apple_gfx_new_frame_cb(void *ctx)
 {
-    AppleGFXDisplay *d = ctx;
-
-    trace_apple_gfx_new_frame();
-    aio_bh_schedule_oneshot(qemu_get_aio_context(), new_frame_handler_bh, d);
+    apple_gfx_event_push(apple_gfx_event_new(ctx, APPLE_GFX_EVENT_FRAME));
 }
 
 static void apple_gfx_mode_change_cb(void *ctx, uint16_t width,
                                      uint16_t height, uint32_t pixel_format)
 {
-    AppleGFXDisplay *d = ctx;
-
-    trace_apple_gfx_mode_change(width, height);
-
-    /*
-     * Synchronous, so that the surface is in place before any BH scheduled
-     * after it runs.
-     */
-    BQL_LOCK_GUARD();
-    set_mode(d, width, height);
+    AppleGFXEvent *event = apple_gfx_event_new(ctx, APPLE_GFX_EVENT_MODE);
+    event->pointer.width = width;
+    event->pointer.height = height;
+    apple_gfx_event_push(event);
 }
 
 static void apple_gfx_cursor_glyph_cb(void *ctx, const RvgCursorGlyph *glyph)
 {
-    AppleGFXDisplay *d = ctx;
-    AppleGFXEvent *event = apple_gfx_event_new(d,
+    AppleGFXEvent *event = apple_gfx_event_new(ctx,
                                                APPLE_GFX_EVENT_CURSOR_GLYPH);
     /* height rows of width * 4 bytes */
     size_t length = (size_t)glyph->width * 4 * glyph->height;
@@ -868,8 +914,7 @@ static void apple_gfx_cursor_glyph_cb(void *ctx, const RvgCursorGlyph *glyph)
 /* show is the guest's byte: any value but 0 shows the cursor. */
 static void apple_gfx_cursor_show_cb(void *ctx, uint8_t show)
 {
-    AppleGFXDisplay *d = ctx;
-    AppleGFXEvent *event = apple_gfx_event_new(d, APPLE_GFX_EVENT_CURSOR_SHOW);
+    AppleGFXEvent *event = apple_gfx_event_new(ctx, APPLE_GFX_EVENT_CURSOR_SHOW);
 
     trace_apple_gfx_cursor_show(show);
     event->show = show != 0;
@@ -878,10 +923,9 @@ static void apple_gfx_cursor_show_cb(void *ctx, uint8_t show)
 
 static void apple_gfx_cursor_move_cb(void *ctx)
 {
-    AppleGFXDisplay *d = ctx;
 
     trace_apple_gfx_cursor_move();
-    apple_gfx_event_push(apple_gfx_event_new(d, APPLE_GFX_EVENT_CURSOR_MOVE));
+    apple_gfx_event_push(apple_gfx_event_new(ctx, APPLE_GFX_EVENT_CURSOR_MOVE));
 }
 
 /*
@@ -1087,20 +1131,17 @@ static bool apple_gfx_parse_resolution(const char *str, uint16_t *width,
     return true;
 }
 
-bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
-                              RvgDeviceConfig *config, Error **errp)
+static bool apple_gfx_connect(AppleGFXState *s, uint32_t port, Error **errp)
 {
     static const char display_name[] = "Reims vGPU";
-    g_autoptr(GArray) memory_ranges = NULL;
-    g_autoptr(GArray) memory_files = NULL;
     g_autofree RvgDisplayMode *modes = NULL;
     const AppleGFXDisplayMode *display_modes = apple_gfx_default_modes;
     uint32_t num_display_modes = ARRAY_SIZE(apple_gfx_default_modes);
     bool modes_property = s->display_modes != NULL &&
                           s->num_display_modes > 0;
-    RvgMemoryMap memory_map;
     RvgDisplayCallbacks display_callbacks = {
         .struct_size = sizeof(display_callbacks),
+        .destroy = apple_gfx_callback_destroy,
         .mode_change = apple_gfx_mode_change_cb,
         .new_frame = apple_gfx_new_frame_cb,
         .cursor_glyph = apple_gfx_cursor_glyph_cb,
@@ -1109,6 +1150,7 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
     };
     RvgWindowCallbacks window_callbacks = {
         .struct_size = sizeof(window_callbacks),
+        .destroy = apple_gfx_callback_destroy,
         .pointer = apple_gfx_window_pointer_cb,
         .key = apple_gfx_window_key_cb,
         .close = apple_gfx_window_close_cb,
@@ -1133,20 +1175,153 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
         .callbacks = &display_callbacks,
     };
     RvgStatus status;
+
+    AppleGFXDisplay *d = &s->displays[port];
+    AppleGFXCallback *ctx;
+
+    if (!apple_gfx_parse_resolution(s->resolution, &window_config.mode_width,
+                                    &window_config.mode_height,
+                                    &window_config.mode_pixels_per_inch, errp)) {
+        return false;
+    }
+    ctx = g_new0(AppleGFXCallback, 1);
+    ctx->d = d;
+    ctx->generation = ++d->generation;
+    ctx->refs = s->window ? 2 : 1;
+    display_callbacks.ctx = ctx;
+    window_callbacks.ctx = ctx;
+    display_config.port = port;
+    display_config.serial_number = d->serial;
+    display_config.window = s->window ? &window_config : NULL;
+    d->cursor_show = true;
+    status = rvg_display_create(s->pgdev, &display_config, &d->pgdisp);
+    if (status != RVG_OK) {
+        error_setg(errp, "apple-gfx: create port %u: %s", port,
+                   rvg_status_message(status));
+        return false;
+    }
+    if (modes_property) {
+        display_modes = s->display_modes;
+        num_display_modes = s->num_display_modes;
+    }
+    if (!s->window || modes_property) {
+        modes = apple_gfx_new_display_modes(display_modes, num_display_modes);
+        rvg_display_set_modes(d->pgdisp, modes, num_display_modes);
+    }
+    return true;
+}
+
+static void apple_gfx_disconnect(AppleGFXState *s, uint32_t port)
+{
+    AppleGFXDisplay *d = &s->displays[port];
+    RvgDisplay *display = d->pgdisp;
+
+    for (unsigned int usage = 0; usage < ARRAY_SIZE(d->keys); usage++) {
+        if (d->keys[usage]) {
+            apple_gfx_input_key(d, usage, false);
+        }
+    }
+    if (s->input_buttons) {
+        qemu_input_queue_btn(d->con, INPUT_BUTTON_LEFT, false);
+        qemu_input_queue_btn(d->con, INPUT_BUTTON_RIGHT, false);
+        qemu_input_queue_btn(d->con, INPUT_BUTTON_MIDDLE, false);
+        qemu_input_queue_btn(d->con, INPUT_BUTTON_SIDE, false);
+        qemu_input_queue_btn(d->con, INPUT_BUTTON_EXTRA, false);
+        qemu_input_event_sync();
+        s->input_buttons = 0;
+    }
+    /* Pool workers use the display pointer, but never wait for the BQL. */
+    thread_pool_wait(s->pool);
+    d->pgdisp = NULL;
+    d->generation++;
+    d->frame_dirty = false;
+    rvg_display_release(display);
+    rvg_frame_target_release(d->target);
+    d->target = NULL;
+    d->surface = qemu_create_displaysurface(640, 480);
+    memset(surface_data(d->surface), 0,
+           surface_stride(d->surface) * surface_height(d->surface));
+    qemu_console_set_surface(d->con, d->surface);
+    if (d->cursor) {
+        cursor_unref(d->cursor);
+        d->cursor = NULL;
+    }
+    qemu_console_set_mouse(d->con, 0, 0, false);
+}
+
+static void apple_gfx_count_event(AppleGFXState *s)
+{
+    qapi_event_send_reims_display_count_changed(s->owner->id ?: "",
+                                               s->num_displays);
+}
+
+static bool apple_gfx_set_count(AppleGFXState *s, uint32_t count, Error **errp)
+{
+    uint32_t original = s->num_displays;
+    assert(bql_locked());
+    if (!s->pgdev || count < 1 || count > s->display_ports) {
+        error_setg(errp, "display count must be 1 to %u on a realized GPU",
+                   s->display_ports);
+        return false;
+    }
+    while (s->num_displays < count) {
+        if (!apple_gfx_connect(s, s->num_displays, errp)) {
+            while (s->num_displays > original) {
+                apple_gfx_disconnect(s, --s->num_displays);
+            }
+            return false;
+        }
+        s->num_displays++;
+    }
+    while (s->num_displays > count) {
+        apple_gfx_disconnect(s, --s->num_displays);
+    }
+    if (original != count) {
+        apple_gfx_count_event(s);
+    }
+    return true;
+}
+
+static void apple_gfx_get_count(Object *obj, Visitor *v, const char *name,
+                                void *opaque, Error **errp)
+{
+    AppleGFXState *s = opaque;
+    uint32_t count = s->num_displays;
+    visit_type_uint32(v, name, &count, errp);
+}
+
+static void apple_gfx_put_count(Object *obj, Visitor *v, const char *name,
+                                void *opaque, Error **errp)
+{
+    uint32_t count;
+    if (visit_type_uint32(v, name, &count, errp)) {
+        apple_gfx_set_count(opaque, count, errp);
+    }
+}
+
+bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
+                              RvgDeviceConfig *config, Error **errp)
+{
+    g_autoptr(GArray) memory_ranges = NULL;
+    g_autoptr(GArray) memory_files = NULL;
+    RvgMemoryMap memory_map;
+    RvgStatus status;
     uint32_t i;
 
+    s->owner = dev;
+    if (!s->display_ports) {
+        s->display_ports = s->num_displays;
+    }
+    if (s->display_ports < s->num_displays ||
+        s->display_ports > RVG_MAX_DISPLAY_PORTS) {
+        error_setg(errp, "display-ports must be displays to %u", RVG_MAX_DISPLAY_PORTS);
+        return false;
+    }
     if (s->num_displays < 1 || s->num_displays > RVG_MAX_DISPLAY_PORTS) {
         error_setg(errp, "apple-gfx: displays must be 1 to %u, not %" PRIu32,
                    RVG_MAX_DISPLAY_PORTS, s->num_displays);
         return false;
     }
-    if (!apple_gfx_parse_resolution(s->resolution, &window_config.mode_width,
-                                    &window_config.mode_height,
-                                    &window_config.mode_pixels_per_inch,
-                                    errp)) {
-        return false;
-    }
-
     if (apple_gfx_mig_blocker == NULL) {
         error_setg(&apple_gfx_mig_blocker,
                   "Migration state blocked by apple-gfx display device");
@@ -1165,7 +1340,7 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
         .ranges = (const RvgMemoryRange *)memory_ranges->data,
         .range_count = memory_ranges->len,
     };
-    config->display_port_count = s->num_displays;
+    config->display_port_count = s->display_ports;
     config->metal_registry_id = 0; /* the system's default Metal device */
     config->memory_map = &memory_map;
 
@@ -1174,7 +1349,8 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
     QSIMPLEQ_INIT(&s->events);
     s->event_bh = qemu_bh_new(apple_gfx_event_bh, s);
     s->window = apple_gfx_window_wanted();
-    for (i = 0; i < s->num_displays; i++) {
+    for (i = 0; i < s->display_ports; i++) {
+        s->displays[i].serial = next_pgdisplay_serial_num++;
         s->displays[i].state = s;
         s->displays[i].cursor_show = true;
     }
@@ -1186,45 +1362,15 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
         goto fail;
     }
 
-    if (modes_property) {
-        trace_apple_gfx_common_realize_modes_property(s->num_display_modes);
-        display_modes = s->display_modes;
-        num_display_modes = s->num_display_modes;
-    }
-    if (!s->window || modes_property) {
-        modes = apple_gfx_new_display_modes(display_modes, num_display_modes);
-    }
-
-    for (i = 0; i < s->num_displays; i++) {
-        AppleGFXDisplay *d = &s->displays[i];
-
-        display_callbacks.ctx = d;
-        window_callbacks.ctx = d;
-        display_config.port = i;
-        display_config.window = s->window ? &window_config : NULL;
-        /*
-         * The macOS guest ignores displays that share a serial number, those
-         * of other instances of the device among them, so each display gets
-         * a unique one.
-         */
-        display_config.serial_number = next_pgdisplay_serial_num++;
-        status = rvg_display_create(s->pgdev, &display_config, &d->pgdisp);
-        if (status != RVG_OK) {
-            error_setg(errp, "apple-gfx: rvg_display_create: %s",
-                       rvg_status_message(status));
-            goto fail;
-        }
-
-        /* A window offers its own modes, unless display-modes names some. */
-        if (modes) {
-            rvg_display_set_modes(d->pgdisp, modes, num_display_modes);
-        }
-    }
-
-    for (i = 0; i < s->num_displays; i++) {
+    for (i = 0; i < s->display_ports; i++) {
         s->displays[i].con = qemu_graphic_console_create(dev, i,
                                                          &apple_gfx_fb_ops,
                                                          &s->displays[i]);
+    }
+    for (i = 0; i < s->num_displays; i++) {
+        if (!apple_gfx_connect(s, i, errp)) {
+            goto fail;
+        }
     }
 
     /* App Nap would slow the VM while no window of QEMU's is seen. */

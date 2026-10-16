@@ -1815,3 +1815,41 @@
 { 'command': 'client_migrate_info',
   'data': { 'protocol': 'str', 'hostname': 'str', '*port': 'int',
             '*tls-port': 'int', '*cert-subject': 'str' } }
+
+##
+# @ReimsDisplayState:
+# @device: GPU device ID.
+# @count: Connected monitors, including the primary.
+# @ports: Available virtual display ports.
+# Since: 11.0
+##
+{ 'struct': 'ReimsDisplayState',
+  'data': { 'device': 'str', 'count': 'uint32', 'ports': 'uint32' } }
+
+##
+# @query-reims-displays:
+# @device: GPU device ID.
+# Returns: Connected monitor count.
+# Since: 11.0
+##
+{ 'command': 'query-reims-displays', 'data': { 'device': 'str' },
+  'returns': 'ReimsDisplayState' }
+
+##
+# @reims-set-display-count:
+# @device: GPU device ID.
+# @count: Desired connected monitor count.
+# Returns: Actual connected monitor count after success.
+# Since: 11.0
+##
+{ 'command': 'reims-set-display-count',
+  'data': { 'device': 'str', 'count': 'uint32' }, 'returns': 'ReimsDisplayState' }
+
+##
+# @REIMS_DISPLAY_COUNT_CHANGED:
+# @device: GPU device ID.
+# @count: Connected monitor count.
+# Since: 11.0
+##
+{ 'event': 'REIMS_DISPLAY_COUNT_CHANGED',
+  'data': { 'device': 'str', 'count': 'uint32' } }

@@ -210,6 +210,7 @@ static const Property apple_gfx_pci_properties[] = {
                       qdev_prop_apple_gfx_display_mode, AppleGFXDisplayMode),
     /* The guest's display ports, 1 to RVG_MAX_DISPLAY_PORTS. */
     DEFINE_PROP_UINT32("displays", AppleGFXPCIState, common.num_displays, 1),
+    DEFINE_PROP_UINT32("display-ports", AppleGFXPCIState, common.display_ports, 0),
     /*
      * In window mode, the mode the guest runs first, scaled by the window:
      * "<width>x<height>" (default 1920x1080), at 1x or followed by "@<ppi>",
