@@ -1057,6 +1057,16 @@ static bool main_loop_should_exit(int *status)
         } else {
             if (shutdown_exit_code != EXIT_SUCCESS) {
                 *status = shutdown_exit_code;
+            } else if (reboot_action == REBOOT_ACTION_SHUTDOWN &&
+                       (request == SHUTDOWN_CAUSE_GUEST_RESET ||
+                        request == SHUTDOWN_CAUSE_HOST_QMP_SYSTEM_RESET)) {
+                /*
+                 * Local experiment: with -action reboot=shutdown, a reset
+                 * exits with 99 so a launcher can start a fresh QEMU: a
+                 * warm reset under WHPX leaves the firmware stuck (the APs
+                 * never start), a cold start always boots.
+                 */
+                *status = 99;
             } else if (request == SHUTDOWN_CAUSE_GUEST_PANIC &&
                 panic_action == PANIC_ACTION_EXIT_FAILURE) {
                 *status = EXIT_FAILURE;

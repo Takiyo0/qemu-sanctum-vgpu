@@ -664,6 +664,22 @@ void whpx_set_registers(CPUState *cpu, WHPXStateLevel level)
         apic_base.Reg64 = cpu_get_apic_base(X86_CPU(cpu)->apic_state);
         whpx_set_reg(cpu, WHvX64RegisterApicBase, apic_base);
     }
+
+    /*
+     * Local experiment: with the APIC in the hypervisor, Hyper-V, not QEMU's
+     * cpu->halted, decides whether a vCPU runs. A new partition starts the
+     * APs waiting for a SIPI, but a reset left them running: after a guest
+     * restart or an S3 wake every vCPU ran the firmware's reset vector at
+     * once and each one died there (WHPX-UNRECOVERABLE). On a reset, an AP
+     * waits for its SIPI again (StartupSuspend) and the BSP runs.
+     */
+    if (level == WHPX_LEVEL_RESET_STATE && whpx_irqchip_in_kernel()) {
+        WHV_REGISTER_VALUE activity = {};
+        activity.InternalActivity.StartupSuspend =
+            !cpu_is_bsp(X86_CPU(cpu));
+        activity.InternalActivity.HaltSuspend = 0;
+        whpx_set_reg(cpu, WHvRegisterInternalActivityState, activity);
+    }
 }
 
 static int whpx_get_tsc(CPUState *cpu)
@@ -3157,6 +3173,93 @@ void whpx_arch_accel_class_init(ObjectClass *oc)
         "Separate security domain");
 }
 
+/*
+ * Local experiment: opt the whole process out of Windows power throttling
+ * (EcoQoS), which on battery moves a process Windows deems background onto
+ * efficiency cores at low clocks, and coarsens its timers. vCPU threads and
+ * the display's copy threads then run at full speed on battery too.
+ */
+static void whpx_opt_out_of_power_throttling(void)
+{
+    PROCESS_POWER_THROTTLING_STATE state = {0};
+
+    state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED |
+                        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+    state.StateMask = 0;
+    if (!SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling,
+                               &state, sizeof(state))) {
+        warn_report("WHPX: power throttling opt-out failed: %lu",
+                    GetLastError());
+    }
+}
+
+/*
+ * Local experiment: QEMU_PCORES=1 restricts the process (vCPU threads and the
+ * display library's threads alike) to the CPU sets of the highest efficiency
+ * class: the P-cores of a hybrid CPU, so no frame-critical thread lands on an
+ * E-core.
+ */
+static void whpx_restrict_to_pcores(void)
+{
+    const char *on = getenv("QEMU_PCORES");
+    ULONG len = 0;
+    SYSTEM_CPU_SET_INFORMATION *info;
+    BYTE top = 0;
+    ULONG ids[256];
+    ULONG n = 0;
+    BYTE *p, *end;
+
+    typedef BOOL (WINAPI *GetInfoFn)(SYSTEM_CPU_SET_INFORMATION *, ULONG,
+                                     PULONG, HANDLE, ULONG);
+    typedef BOOL (WINAPI *SetDefaultFn)(HANDLE, const ULONG *, ULONG);
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    GetInfoFn get_info;
+    SetDefaultFn set_default;
+
+    if (!on || strcmp(on, "1") != 0) {
+        return;
+    }
+    /* Not declared below _WIN32_WINNT 0x0A00, which QEMU builds under. */
+    get_info = (GetInfoFn)GetProcAddress(k32, "GetSystemCpuSetInformation");
+    set_default = (SetDefaultFn)GetProcAddress(k32, "SetProcessDefaultCpuSets");
+    if (!get_info || !set_default) {
+        warn_report("WHPX: no CPU set API");
+        return;
+    }
+    get_info(NULL, 0, &len, GetCurrentProcess(), 0);
+    info = g_malloc(len);
+    if (!get_info(info, len, &len, GetCurrentProcess(), 0)) {
+        warn_report("WHPX: GetSystemCpuSetInformation failed: %lu",
+                    GetLastError());
+        g_free(info);
+        return;
+    }
+    end = (BYTE *)info + len;
+    for (p = (BYTE *)info; p < end;
+         p += ((SYSTEM_CPU_SET_INFORMATION *)p)->Size) {
+        SYSTEM_CPU_SET_INFORMATION *e = (SYSTEM_CPU_SET_INFORMATION *)p;
+        if (e->Type == CpuSetInformation && e->CpuSet.EfficiencyClass > top) {
+            top = e->CpuSet.EfficiencyClass;
+        }
+    }
+    for (p = (BYTE *)info; p < end && n < G_N_ELEMENTS(ids);
+         p += ((SYSTEM_CPU_SET_INFORMATION *)p)->Size) {
+        SYSTEM_CPU_SET_INFORMATION *e = (SYSTEM_CPU_SET_INFORMATION *)p;
+        if (e->Type == CpuSetInformation && e->CpuSet.EfficiencyClass == top) {
+            ids[n++] = e->CpuSet.Id;
+        }
+    }
+    g_free(info);
+    if (!set_default(GetCurrentProcess(), ids, n)) {
+        warn_report("WHPX: SetProcessDefaultCpuSets failed: %lu",
+                    GetLastError());
+        return;
+    }
+    warn_report("WHPX: restricted to %lu CPU sets of efficiency class %u",
+                n, top);
+}
+
 int whpx_accel_init(AccelState *as, MachineState *ms)
 {
     struct whpx_state *whpx;
@@ -3169,13 +3272,16 @@ int whpx_accel_init(AccelState *as, MachineState *ms)
     WHV_PROCESSOR_FEATURES_BANKS processor_features;
     WHV_PROCESSOR_PERFMON_FEATURES perfmon_features;
 
-    UINT32 cpuidExitList[] = {0x0, 0x1, 0x6, 0x7, 0xb, 0xd, 0x14, 0x24, 0x29, 0x1E,
+    UINT32 cpuidExitList[] = {0x0, 0x1, 0x4, 0x6, 0x7, 0xb, 0xd, 0x14, 0x24, 0x29, 0x1E,
         0x40000000, 0x40000001, 0x40000010, 0x80000000, 0x80000001,
         0x80000002, 0x80000003, 0x80000004, 0x80000007, 0x80000008,
         0x8000000A, 0x80000021, 0x80000022, 0xC0000000, 0xC0000001};
 
     X86MachineState *x86ms = X86_MACHINE(ms);
     bool pic_enabled = false;
+
+    whpx_opt_out_of_power_throttling();
+    whpx_restrict_to_pcores();
 
     if (x86ms->pic == ON_OFF_AUTO_ON || x86ms->pic == ON_OFF_AUTO_AUTO) {
         pic_enabled = true;

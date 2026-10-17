@@ -379,6 +379,17 @@ void qemu_input_event_send(QemuConsole *src, QemuInputEvent *evt)
         return;
     }
 
+    /*
+     * Local experiment: a key press or a click wakes a suspended guest, as
+     * PS/2 input does (hw/input/ps2.c), for USB keyboards and tablets too.
+     * Pointer motion does not, so a pointer resting over the window cannot.
+     */
+    if (runstate_check(RUN_STATE_SUSPENDED) &&
+        ((evt->type == INPUT_EVENT_KIND_KEY && evt->key.down) ||
+         (evt->type == INPUT_EVENT_KIND_BTN && evt->btn.down))) {
+        qemu_system_wakeup_request(QEMU_WAKEUP_REASON_OTHER, NULL);
+    }
+
     replay_input_event(src, evt);
 }
 

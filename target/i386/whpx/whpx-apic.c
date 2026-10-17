@@ -170,6 +170,28 @@ static void whpx_put_apic_base(CPUState *cpu, uint64_t val)
     HRESULT hr;
     WHV_REGISTER_VALUE reg_value = {.Reg64 = val};
     WHV_REGISTER_NAME reg_name = WHvX64RegisterApicBase;
+    WHV_REGISTER_VALUE current = {};
+
+    /*
+     * Local experiment: x2APIC to xAPIC directly is not a legal transition,
+     * and a reset after a guest that turned x2APIC on (macOS does) asks for
+     * exactly that. Go through disabled first, as the architecture requires.
+     */
+    if (SUCCEEDED(whp_dispatch.WHvGetVirtualProcessorRegisters(
+            whpx_global.partition, cpu->cpu_index, &reg_name, 1, &current)) &&
+        (current.Reg64 & MSR_IA32_APICBASE_EXTD) &&
+        !(val & MSR_IA32_APICBASE_EXTD)) {
+        WHV_REGISTER_VALUE disabled = {
+            .Reg64 = current.Reg64 &
+                     ~(MSR_IA32_APICBASE_ENABLE | MSR_IA32_APICBASE_EXTD),
+        };
+        hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
+                 whpx_global.partition, cpu->cpu_index,
+                 &reg_name, 1, &disabled);
+        if (FAILED(hr)) {
+            error_report("WHPX: Failed to disable x2APIC, hr=%08lx", hr);
+        }
+    }
 
     hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
              whpx_global.partition,
@@ -179,6 +201,11 @@ static void whpx_put_apic_base(CPUState *cpu, uint64_t val)
 
     if (FAILED(hr)) {
         error_report("WHPX: Failed to set MSR APIC base, hr=%08lx", hr);
+    } else if (SUCCEEDED(whp_dispatch.WHvGetVirtualProcessorRegisters(
+                   whpx_global.partition, cpu->cpu_index, &reg_name, 1,
+                   &current)) && current.Reg64 != val) {
+        warn_report("WHPX: vCPU %d APIC base is %" PRIx64 " after a write of %"
+                    PRIx64, cpu->cpu_index, (uint64_t)current.Reg64, val);
     }
 }
 
