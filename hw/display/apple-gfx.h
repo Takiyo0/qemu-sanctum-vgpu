@@ -95,6 +95,17 @@ struct AppleGFXState {
     QemuMutex event_lock;
     AppleGFXEventQueue events; /* event_lock protected */
     QEMUBH *event_bh;
+    bool event_stats;
+    int64_t event_stats_last_report_ns;
+    uint32_t event_queue_depth;
+    uint64_t event_stats_enqueued;
+    uint64_t event_stats_coalesced;
+    uint64_t event_stats_processed;
+    uint64_t event_stats_bh_count;
+    uint64_t event_stats_max_bh_events;
+    uint64_t event_stats_max_queue_depth;
+    uint64_t event_stats_max_age_ns;
+    uint64_t event_stats_max_bh_ns;
 
     /* Mutable state (BQL protected) */
     uint32_t input_buttons; /* RVG_WINDOW_BUTTON_* bits the guest was sent */

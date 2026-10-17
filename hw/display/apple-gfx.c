@@ -564,6 +564,7 @@ struct AppleGFXEvent {
     AppleGFXDisplay *d;
     AppleGFXEventKind kind;
     uint32_t generation;
+    int64_t queued_at_ns;
     union {
         AppleGFXCursorGlyph glyph;
         bool show;
@@ -590,6 +591,9 @@ static AppleGFXEvent *apple_gfx_event_new(AppleGFXCallback *ctx,
     event->d = ctx->d;
     event->generation = ctx->generation;
     event->kind = kind;
+    if (event->d->state->event_stats) {
+        event->queued_at_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+    }
     return event;
 }
 
@@ -603,6 +607,9 @@ static void apple_gfx_event_push(AppleGFXEvent *event)
     AppleGFXState *s = event->d->state;
 
     WITH_QEMU_LOCK_GUARD(&s->event_lock) {
+        if (s->event_stats) {
+            s->event_stats_enqueued++;
+        }
         if (event->kind == APPLE_GFX_EVENT_POINTER) {
             AppleGFXEvent *last = QSIMPLEQ_LAST(&s->events, AppleGFXEvent, next);
             if (last && last->kind == APPLE_GFX_EVENT_POINTER &&
@@ -613,11 +620,20 @@ static void apple_gfx_event_push(AppleGFXEvent *event)
                 last->pointer.y = event->pointer.y;
                 last->pointer.width = event->pointer.width;
                 last->pointer.height = event->pointer.height;
+                if (s->event_stats) {
+                    last->queued_at_ns = event->queued_at_ns;
+                    s->event_stats_coalesced++;
+                }
                 g_free(event);
                 return;
             }
         }
         QSIMPLEQ_INSERT_TAIL(&s->events, event, next);
+        if (s->event_stats) {
+            s->event_queue_depth++;
+            s->event_stats_max_queue_depth = MAX(
+                s->event_stats_max_queue_depth, s->event_queue_depth);
+        }
     }
     qemu_bh_schedule(s->event_bh);
 }
@@ -680,6 +696,15 @@ static void apple_gfx_event_bh(void *opaque)
 {
     AppleGFXState *s = opaque;
     AppleGFXEvent *event;
+    int64_t started_ns = s->event_stats ? qemu_clock_get_ns(QEMU_CLOCK_HOST) : 0;
+    int64_t now_ns;
+    uint64_t processed = 0;
+    uint64_t max_age_ns = 0;
+    uint64_t enqueued = 0, coalesced = 0, total_processed = 0;
+    uint64_t bh_count = 0, max_bh_events = 0, max_depth = 0;
+    uint64_t max_age = 0, max_bh = 0;
+    uint32_t queue_depth = 0;
+    bool report = false;
 
     assert(bql_locked());
     /* One at a time, so a nested run still takes them in order. */
@@ -688,6 +713,12 @@ static void apple_gfx_event_bh(void *opaque)
             event = QSIMPLEQ_FIRST(&s->events);
             if (event) {
                 QSIMPLEQ_REMOVE_HEAD(&s->events, next);
+                if (s->event_stats) {
+                    int64_t popped_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+                    s->event_queue_depth--;
+                    max_age_ns = MAX(max_age_ns,
+                                     popped_ns - event->queued_at_ns);
+                }
             }
         }
         if (event == NULL) {
@@ -695,6 +726,53 @@ static void apple_gfx_event_bh(void *opaque)
         }
         apple_gfx_event_run(event);
         g_free(event);
+        processed++;
+    }
+
+    if (!s->event_stats) {
+        return;
+    }
+    now_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+    WITH_QEMU_LOCK_GUARD(&s->event_lock) {
+        s->event_stats_processed += processed;
+        s->event_stats_bh_count++;
+        s->event_stats_max_bh_events = MAX(s->event_stats_max_bh_events,
+                                           processed);
+        s->event_stats_max_age_ns = MAX(s->event_stats_max_age_ns,
+                                        max_age_ns);
+        s->event_stats_max_bh_ns = MAX(s->event_stats_max_bh_ns,
+                                      now_ns - started_ns);
+        if (now_ns - s->event_stats_last_report_ns >= 1000000000LL) {
+            enqueued = s->event_stats_enqueued;
+            coalesced = s->event_stats_coalesced;
+            total_processed = s->event_stats_processed;
+            bh_count = s->event_stats_bh_count;
+            max_bh_events = s->event_stats_max_bh_events;
+            max_depth = s->event_stats_max_queue_depth;
+            max_age = s->event_stats_max_age_ns;
+            max_bh = s->event_stats_max_bh_ns;
+            queue_depth = s->event_queue_depth;
+            s->event_stats_enqueued = 0;
+            s->event_stats_coalesced = 0;
+            s->event_stats_processed = 0;
+            s->event_stats_bh_count = 0;
+            s->event_stats_max_bh_events = 0;
+            s->event_stats_max_queue_depth = queue_depth;
+            s->event_stats_max_age_ns = 0;
+            s->event_stats_max_bh_ns = 0;
+            s->event_stats_last_report_ns = now_ns;
+            report = true;
+        }
+    }
+    if (report) {
+        fprintf(stderr,
+                "REIMS_INPUT_STATS enqueued=%" PRIu64 " coalesced=%" PRIu64
+                " processed=%" PRIu64 " bh=%" PRIu64 " avg_per_bh=%" PRIu64
+                " max_per_bh=%" PRIu64 " queue_depth=%u max_queue=%" PRIu64
+                " max_age_us=%" PRIu64 " max_bh_us=%" PRIu64 "\n",
+                enqueued, coalesced, total_processed, bh_count,
+                bh_count ? total_processed / bh_count : 0, max_bh_events,
+                queue_depth, max_depth, max_age / 1000, max_bh / 1000);
     }
 }
 
@@ -1347,6 +1425,8 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
     s->pool = thread_pool_new();
     qemu_mutex_init(&s->event_lock);
     QSIMPLEQ_INIT(&s->events);
+    s->event_stats = g_strcmp0(g_getenv("REIMS_VGPU_EVENT_STATS"), "1") == 0;
+    s->event_stats_last_report_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
     s->event_bh = qemu_bh_new(apple_gfx_event_bh, s);
     s->window = apple_gfx_window_wanted();
     for (i = 0; i < s->display_ports; i++) {

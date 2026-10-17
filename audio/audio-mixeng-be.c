@@ -594,6 +594,7 @@ static void audio_reset_timer(AudioMixengBackend *s)
         if (!s->timer_running) {
             s->timer_running = true;
             s->timer_last = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            s->timer_host_last = qemu_clock_get_ns(QEMU_CLOCK_HOST);
             trace_audio_timer_start(s->period_ticks / SCALE_MS);
         }
     } else {
@@ -607,17 +608,28 @@ static void audio_reset_timer(AudioMixengBackend *s)
 
 static void audio_timer (void *opaque)
 {
-    int64_t now, diff;
+    int64_t now, diff, host_now, host_diff, run_started_ns, run_duration_ns;
     AudioMixengBackend *s = opaque;
 
     now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     diff = now - s->timer_last;
+    host_now = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+    host_diff = host_now - s->timer_host_last;
     if (diff > s->period_ticks * 3 / 2) {
         trace_audio_timer_delayed(diff / SCALE_MS);
     }
     s->timer_last = now;
+    s->timer_host_last = host_now;
 
+    run_started_ns = host_now;
     audio_run(s, "timer");
+    run_duration_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST) - run_started_ns;
+    if (host_diff > s->period_ticks * 3 / 2 ||
+        run_duration_ns > s->period_ticks / 2) {
+        trace_audio_timer_host_slow((int)(host_diff / SCALE_MS),
+                                    (int)(diff / SCALE_MS),
+                                    (int)(run_duration_ns / 1000));
+    }
     audio_reset_timer(s);
 }
 
