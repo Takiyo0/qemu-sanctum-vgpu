@@ -621,6 +621,11 @@ static void audio_timer (void *opaque)
     s->timer_last = now;
     s->timer_host_last = host_now;
 
+    s->timer_trace_stages = trace_event_get_state(TRACE_AUDIO_TIMER_HOST_SLOW);
+    s->timer_stage_hw_free_ns = 0;
+    s->timer_stage_callback_ns = 0;
+    s->timer_stage_pcm_ns = 0;
+    s->timer_stage_buffer_ns = 0;
     run_started_ns = host_now;
     audio_run(s, "timer");
     run_duration_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST) - run_started_ns;
@@ -628,7 +633,11 @@ static void audio_timer (void *opaque)
         run_duration_ns > s->period_ticks / 2) {
         trace_audio_timer_host_slow((int)(host_diff / SCALE_MS),
                                     (int)(diff / SCALE_MS),
-                                    (int)(run_duration_ns / 1000));
+                                    (int)(run_duration_ns / 1000),
+                                    (int)(s->timer_stage_hw_free_ns / 1000),
+                                    (int)(s->timer_stage_callback_ns / 1000),
+                                    (int)(s->timer_stage_pcm_ns / 1000),
+                                    (int)(s->timer_stage_buffer_ns / 1000));
     }
     audio_reset_timer(s);
 }
@@ -928,8 +937,18 @@ static void audio_run_out(AudioMixengBackend *s)
 
     while ((hw = audio_pcm_hw_find_any_enabled_out(s, hw))) {
         size_t played, live, prev_rpos;
-        size_t hw_free = audio_pcm_hw_get_free(hw);
+        size_t hw_free;
+        int64_t stage_started_ns;
         int nb_live;
+
+        if (s->timer_trace_stages) {
+            stage_started_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+        }
+        hw_free = audio_pcm_hw_get_free(hw);
+        if (s->timer_trace_stages) {
+            s->timer_stage_hw_free_ns +=
+                qemu_clock_get_ns(QEMU_CLOCK_HOST) - stage_started_ns;
+        }
 
         if (!audio_get_pdo_out(s->dev)->mixing_engine) {
             /* there is exactly 1 sw for each hw with no mixeng */
@@ -944,12 +963,26 @@ static void audio_run_out(AudioMixengBackend *s)
             }
 
             if (sw->active) {
+                if (s->timer_trace_stages) {
+                    stage_started_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+                }
                 sw->callback.fn(sw->callback.opaque,
                                 hw_free * sw->info.bytes_per_frame);
+                if (s->timer_trace_stages) {
+                    s->timer_stage_callback_ns +=
+                        qemu_clock_get_ns(QEMU_CLOCK_HOST) - stage_started_ns;
+                }
             }
 
             if (k->run_buffer_out) {
+                if (s->timer_trace_stages) {
+                    stage_started_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+                }
                 k->run_buffer_out(hw);
+                if (s->timer_trace_stages) {
+                    s->timer_stage_buffer_ns +=
+                        qemu_clock_get_ns(QEMU_CLOCK_HOST) - stage_started_ns;
+                }
             }
 
             continue;
@@ -969,8 +1002,15 @@ static void audio_run_out(AudioMixengBackend *s)
                 if (free > sw->resample_buf.pos) {
                     free = MIN(free, sw->resample_buf.size)
                            - sw->resample_buf.pos;
+                    if (s->timer_trace_stages) {
+                        stage_started_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+                    }
                     sw->callback.fn(sw->callback.opaque,
                                     free * sw->info.bytes_per_frame);
+                    if (s->timer_trace_stages) {
+                        s->timer_stage_callback_ns +=
+                            qemu_clock_get_ns(QEMU_CLOCK_HOST) - stage_started_ns;
+                    }
                 }
             }
         }
@@ -1003,13 +1043,27 @@ static void audio_run_out(AudioMixengBackend *s)
 
         if (!live) {
             if (k->run_buffer_out) {
+                if (s->timer_trace_stages) {
+                    stage_started_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+                }
                 k->run_buffer_out(hw);
+                if (s->timer_trace_stages) {
+                    s->timer_stage_buffer_ns +=
+                        qemu_clock_get_ns(QEMU_CLOCK_HOST) - stage_started_ns;
+                }
             }
             continue;
         }
 
         prev_rpos = hw->mix_buf.pos;
+        if (s->timer_trace_stages) {
+            stage_started_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+        }
         played = audio_pcm_hw_run_out(hw, live);
+        if (s->timer_trace_stages) {
+            s->timer_stage_pcm_ns +=
+                qemu_clock_get_ns(QEMU_CLOCK_HOST) - stage_started_ns;
+        }
         replay_audio_out(&played);
         if (hw->mix_buf.pos >= hw->mix_buf.size) {
             audio_bug("hw->mix_buf.pos=%zu hw->mix_buf.size=%zu played=%zu",

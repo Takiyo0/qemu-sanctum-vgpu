@@ -230,6 +230,11 @@ struct AudioMixengBackend {
     bool timer_running;
     uint64_t timer_last;
     uint64_t timer_host_last;
+    bool timer_trace_stages;
+    int64_t timer_stage_hw_free_ns;
+    int64_t timer_stage_callback_ns;
+    int64_t timer_stage_pcm_ns;
+    int64_t timer_stage_buffer_ns;
     VMChangeStateEntry *vmse;
 };
 
