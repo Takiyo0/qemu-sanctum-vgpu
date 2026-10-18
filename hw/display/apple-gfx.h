@@ -14,6 +14,7 @@
 #include "block/thread-pool.h"
 #include "qemu/queue.h"
 #include "qemu/thread.h"
+#include "chardev/char-fe.h"
 #include <reims_vgpu.h>
 
 #define TYPE_APPLE_GFX_MMIO         "apple-gfx-mmio"
@@ -106,6 +107,18 @@ struct AppleGFXState {
     uint64_t event_stats_max_queue_depth;
     uint64_t event_stats_max_age_ns;
     uint64_t event_stats_max_bh_ns;
+
+    /*
+     * The guest's pointer agent (qemu-vm/guest-agent): a chardev the agent
+     * connects to. While it is connected, each window's pointer position goes
+     * to it as the display's serial number and the position in the mode, and
+     * the agent moves the guest's cursor onto that display; the USB tablet
+     * then carries only buttons and scrolling. macOS maps the tablet's
+     * absolute axes onto its main display alone, so a second display is
+     * otherwise out of the pointer's reach.
+     */
+    CharFrontend pointer_chr;
+    bool pointer_agent; /* BQL protected: the agent is connected */
 
     /* Mutable state (BQL protected) */
     uint32_t input_buttons; /* RVG_WINDOW_BUTTON_* bits the guest was sent */

@@ -19,6 +19,7 @@
 #include "qemu/main-loop.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-properties-system.h"
 #include "apple-gfx.h"
 #include "trace.h"
 
@@ -201,6 +202,8 @@ static const Property apple_gfx_mmio_properties[] = {
      * own modes at its density.
      */
     DEFINE_PROP_STRING("resolution", AppleGFXMMIOState, common.resolution),
+    /* The guest pointer agent's chardev (apple-gfx.h, pointer_chr) */
+    DEFINE_PROP_CHR("pointer-chardev", AppleGFXMMIOState, common.pointer_chr),
 };
 
 static void apple_gfx_mmio_class_init(ObjectClass *klass, const void *data)

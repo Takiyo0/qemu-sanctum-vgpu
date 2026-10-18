@@ -442,8 +442,21 @@ static void apple_gfx_input_pointer(AppleGFXDisplay *d, uint16_t x,
     /* QEMU's input layer does not clamp absolute axes. */
     width = MAX(width, 1);
     height = MAX(height, 1);
-    qemu_input_queue_abs(d->con, INPUT_AXIS_X, MIN(x, width - 1), 0, width);
-    qemu_input_queue_abs(d->con, INPUT_AXIS_Y, MIN(y, height - 1), 0, height);
+    x = MIN(x, width - 1);
+    y = MIN(y, height - 1);
+    if (s->pointer_agent) {
+        /*
+         * The agent places the cursor; the tablet's axes stay where they
+         * were, and macOS moves the pointer only for an axis that changes.
+         */
+        char line[80];
+        int len = snprintf(line, sizeof(line), "P %u %u %u %u %u %u\n",
+                           d->serial, x, y, width, height, buttons);
+        qemu_chr_fe_write(&s->pointer_chr, (const uint8_t *)line, len);
+    } else {
+        qemu_input_queue_abs(d->con, INPUT_AXIS_X, x, 0, width);
+        qemu_input_queue_abs(d->con, INPUT_AXIS_Y, y, 0, height);
+    }
     qemu_input_update_buttons(d->con, button_map, s->input_buttons, buttons);
     s->input_buttons = buttons;
     qemu_input_event_sync();
@@ -1377,6 +1390,34 @@ static void apple_gfx_put_count(Object *obj, Visitor *v, const char *name,
     }
 }
 
+/* The pointer agent's lines to QEMU ("hello" and the like) are not used. */
+static int apple_gfx_pointer_can_read(void *opaque)
+{
+    return 256;
+}
+
+static void apple_gfx_pointer_read(void *opaque, const uint8_t *buf, int size)
+{
+}
+
+static void apple_gfx_pointer_event(void *opaque, QEMUChrEvent event)
+{
+    AppleGFXState *s = opaque;
+
+    switch (event) {
+    case CHR_EVENT_OPENED:
+        s->pointer_agent = true;
+        info_report("apple-gfx: pointer agent connected");
+        break;
+    case CHR_EVENT_CLOSED:
+        s->pointer_agent = false;
+        info_report("apple-gfx: pointer agent disconnected");
+        break;
+    default:
+        break;
+    }
+}
+
 bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
                               RvgDeviceConfig *config, Error **errp)
 {
@@ -1433,6 +1474,12 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
         s->displays[i].serial = next_pgdisplay_serial_num++;
         s->displays[i].state = s;
         s->displays[i].cursor_show = true;
+    }
+
+    if (qemu_chr_fe_backend_connected(&s->pointer_chr)) {
+        qemu_chr_fe_set_handlers(&s->pointer_chr, apple_gfx_pointer_can_read,
+                                 apple_gfx_pointer_read,
+                                 apple_gfx_pointer_event, NULL, s, NULL, true);
     }
 
     status = rvg_device_create(config, &s->pgdev);

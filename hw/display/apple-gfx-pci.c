@@ -29,6 +29,7 @@
 #include "hw/core/boards.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/msi.h"
+#include "hw/core/qdev-properties-system.h"
 #include "apple-gfx.h"
 #include "trace.h"
 
@@ -218,6 +219,8 @@ static const Property apple_gfx_pci_properties[] = {
      * own modes at its density.
      */
     DEFINE_PROP_STRING("resolution", AppleGFXPCIState, common.resolution),
+    /* The guest pointer agent's chardev (apple-gfx.h, pointer_chr) */
+    DEFINE_PROP_CHR("pointer-chardev", AppleGFXPCIState, common.pointer_chr),
     /* BAR 2, the EFI framebuffer's window for guests without a driver */
     DEFINE_PROP_BOOL("efi-framebuffer-bar", AppleGFXPCIState, efi_fb_bar, true),
 };
