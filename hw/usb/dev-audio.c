@@ -38,6 +38,7 @@
 #include "qemu/audio.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
+#include "trace.h"
 
 static void usb_audio_reinit(USBDevice *dev, unsigned channels);
 
@@ -686,20 +687,15 @@ static void usb_audio_stats_report(USBAudioState *s, int64_t now_ns)
     }
 
     packet_size = USBAUDIO_PACKET_SIZE(s->out.channels);
-    fprintf(stderr,
-            "QEMU_AUDIO_STATS packets=%" PRIu64 " drop_full=%" PRIu64
-            " bad_size=%" PRIu64 " callbacks=%" PRIu64
-            " empty_callbacks=%" PRIu64 " partial_writes=%" PRIu64
-            " callback_gaps_gt_15ms=%" PRIu64 " max_callback_gap_ms=%" PRIu64
-            " output_bytes=%" PRIu64 " queue_highwater_packets=%u"
-            " queue_capacity_packets=%zu rate=%u channels=%u\n",
-            s->stats_packets, s->stats_drop_full, s->stats_bad_size,
-            s->stats_callbacks, s->stats_empty_callbacks,
-            s->stats_partial_writes, s->stats_callback_gaps_over_15ms,
-            s->stats_max_callback_gap_ns / 1000000,
-            s->stats_output_bytes, s->stats_queue_highwater_packets,
-            packet_size ? s->out.buf.size / packet_size : 0,
-            USBAUDIO_SAMPLE_RATE, s->out.channels);
+    trace_usb_audio_stats(s->stats_packets, s->stats_drop_full,
+                          s->stats_bad_size, s->stats_callbacks,
+                          s->stats_empty_callbacks, s->stats_partial_writes,
+                          s->stats_callback_gaps_over_15ms,
+                          s->stats_max_callback_gap_ns / 1000000,
+                          s->stats_output_bytes);
+    trace_usb_audio_stats_queue(s->stats_queue_highwater_packets,
+                                packet_size ? s->out.buf.size / packet_size : 0,
+                                s->out.channels, USBAUDIO_SAMPLE_RATE);
 
     s->stats_last_report_ns = now_ns;
     s->stats_packets = 0;

@@ -399,3 +399,7 @@ usb_vmapple_tablet_report(uint8_t buttons, uint16_t x, uint16_t y, int16_t wheel
 usb_vmapple_tablet_queue_full(void) "queue full"
 usb_vmapple_tablet_get_report(uint8_t type, uint8_t id) "type %u id %u"
 usb_vmapple_tablet_set_report(uint8_t id, uint8_t value) "feature %u value %u"
+
+# dev-audio.c
+usb_audio_stats(uint64_t packets, uint64_t drop_full, uint64_t bad_size, uint64_t callbacks, uint64_t empty_callbacks, uint64_t partial_writes, uint64_t gaps_over_15ms, uint64_t max_gap_ms, uint64_t output_bytes) "packets=%" PRIu64 " drop_full=%" PRIu64 " bad_size=%" PRIu64 " callbacks=%" PRIu64 " empty_callbacks=%" PRIu64 " partial_writes=%" PRIu64 " gaps_gt_15ms=%" PRIu64 " max_gap_ms=%" PRIu64 " output_bytes=%" PRIu64
+usb_audio_stats_queue(uint32_t highwater_packets, uint32_t capacity_packets, uint32_t channels, uint32_t rate) "queue_highwater_packets=%u queue_capacity_packets=%u channels=%u rate=%u"
