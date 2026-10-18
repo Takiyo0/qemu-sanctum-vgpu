@@ -1042,6 +1042,111 @@ static int emulate_msr_instruction(CPUState *cpu,
     return 0;
 }
 
+/*
+ * Fast path for the common MMIO forms: a 32/64-bit `mov` between a general register and memory
+ * (8B /r, 89 /r) and a store of an immediate (C7 /0), in 64-bit code, with at most a REX prefix.
+ * Only the one register and RIP cross the hypervisor boundary, instead of the full register
+ * state (and the XSAVE area) the instruction emulator reads and writes back for every access.
+ * Anything else, or a vCPU whose QEMU-side state is dirty, takes the emulator.
+ * QEMU_WHPX_MMIO_FAST=0 turns it off.
+ */
+static bool whpx_mmio_fast(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
+{
+    static int enabled = -1;
+    WHV_MEMORY_ACCESS_CONTEXT *ctx = &exit_ctx->MemoryAccess;
+    const uint8_t *b = ctx->InstructionBytes;
+    unsigned n = ctx->InstructionByteCount;
+    unsigned len = exit_ctx->VpContext.InstructionLength;
+    unsigned i = 0;
+    uint8_t rex = 0, op, modrm;
+    unsigned size;
+    bool write;
+    int reg;
+    WHV_REGISTER_NAME names[2];
+    WHV_REGISTER_VALUE vals[2];
+    uint64_t v = 0;
+    HRESULT hr;
+    struct whpx_state *whpx = &whpx_global;
+
+    if (enabled < 0) {
+        const char *e = getenv("QEMU_WHPX_MMIO_FAST");
+        enabled = !(e && e[0] == '0');
+    }
+    if (!enabled || cpu->vcpu_dirty || !exit_ctx->VpContext.Cs.Long) {
+        return false;
+    }
+    if (len == 0 || len > n || len > 15) {
+        return false;
+    }
+    if ((b[i] & 0xF0) == 0x40) {
+        rex = b[i++];
+    }
+    if (i + 1 >= len) {
+        return false;
+    }
+    op = b[i++];
+    modrm = b[i];
+    if ((modrm >> 6) == 3) {
+        return false;
+    }
+    size = (rex & 8) ? 8 : 4;
+    reg = ((modrm >> 3) & 7) | ((rex & 4) ? 8 : 0);
+    switch (op) {
+    case 0x8B:
+        write = false;
+        break;
+    case 0x89:
+        write = true;
+        break;
+    case 0xC7:
+        if (((modrm >> 3) & 7) != 0 || len < 4) {
+            return false;
+        }
+        write = true;
+        reg = -1;
+        break;
+    default:
+        return false;
+    }
+    if (write != (ctx->AccessInfo.AccessType == WHvMemoryAccessWrite)) {
+        return false;
+    }
+    names[1] = WHvX64RegisterRip;
+    vals[1].Reg64 = exit_ctx->VpContext.Rip + len;
+    if (write) {
+        if (reg >= 0) {
+            names[0] = (WHV_REGISTER_NAME)(WHvX64RegisterRax + reg);
+            hr = whp_dispatch.WHvGetVirtualProcessorRegisters(
+                whpx->partition, cpu->cpu_index, &names[0], 1, &vals[0]);
+            if (FAILED(hr)) {
+                return false;
+            }
+            v = vals[0].Reg64;
+        } else {
+            int32_t imm;
+            memcpy(&imm, b + len - 4, 4);
+            v = (uint64_t)(int64_t)imm;
+        }
+        address_space_write(&address_space_memory, ctx->Gpa,
+                            MEMTXATTRS_UNSPECIFIED, &v, size);
+        hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
+            whpx->partition, cpu->cpu_index, &names[1], 1, &vals[1]);
+    } else {
+        address_space_read(&address_space_memory, ctx->Gpa,
+                           MEMTXATTRS_UNSPECIFIED, &v, size);
+        /* A 32-bit load zero-extends into the 64-bit register. */
+        names[0] = (WHV_REGISTER_NAME)(WHvX64RegisterRax + reg);
+        vals[0].Reg64 = v;
+        hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
+            whpx->partition, cpu->cpu_index, names, 2, vals);
+    }
+    if (FAILED(hr)) {
+        error_report("WHPX: MMIO fast path register update failed, hr=%08lx", hr);
+        return false;
+    }
+    return true;
+}
+
 static int whpx_handle_mmio(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
 {
     WHV_MEMORY_ACCESS_CONTEXT *ctx = &exit_ctx->MemoryAccess;
@@ -1140,6 +1245,9 @@ static int whpx_handle_mmio(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
         /* Not RAM (device/MMIO) -> fall through to emulation below. */
     }
 
+    if (whpx_mmio_fast(cpu, exit_ctx)) {
+        return 0;
+    }
     ret = emulate_instruction(cpu, ctx->InstructionBytes, ctx->InstructionByteCount);
     if (ret < 0) {
         error_report("failed to emulate mmio");
