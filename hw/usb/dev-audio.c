@@ -669,7 +669,7 @@ struct USBAudioState {
     uint64_t stats_unfilled_bytes;
     uint64_t stats_unfilled_callbacks;
     uint64_t stats_queue_empty_bytes;
-    uint64_t stats_backend_short_bytes;
+    uint64_t stats_voice_input_unconsumed_bytes;
     uint32_t stats_queue_highwater_packets;
     uint32_t stats_queue_lowwater_packets;
     bool stats_queue_lowwater_valid;
@@ -705,7 +705,7 @@ static void usb_audio_stats_report(USBAudioState *s, int64_t now_ns)
                                s->stats_unfilled_bytes,
                                s->stats_unfilled_callbacks,
                                s->stats_queue_empty_bytes,
-                               s->stats_backend_short_bytes);
+                               s->stats_voice_input_unconsumed_bytes);
     trace_usb_audio_stats_queue(s->stats_queue_highwater_packets,
                                 s->stats_queue_lowwater_valid ?
                                 s->stats_queue_lowwater_packets : 0,
@@ -726,7 +726,7 @@ static void usb_audio_stats_report(USBAudioState *s, int64_t now_ns)
     s->stats_unfilled_bytes = 0;
     s->stats_unfilled_callbacks = 0;
     s->stats_queue_empty_bytes = 0;
-    s->stats_backend_short_bytes = 0;
+    s->stats_voice_input_unconsumed_bytes = 0;
     s->stats_queue_highwater_packets = 0;
     s->stats_queue_lowwater_packets = 0;
     s->stats_queue_lowwater_valid = false;
@@ -773,14 +773,18 @@ static void output_callback(void *opaque, int avail)
         usb_audio_stats_note_queue_lowwater(s);
     }
 
-    while (avail) {
+    while (avail > 0) {
         size_t written, len;
 
         data = streambuf_get(&s->out.buf, &len);
         if (!data) {
             if (s->stats_enabled) {
                 s->stats_empty_callbacks++;
-                s->stats_queue_empty_bytes += avail;
+                if (avail > 0) {
+                    s->stats_unfilled_bytes += avail;
+                    s->stats_unfilled_callbacks++;
+                    s->stats_queue_empty_bytes += avail;
+                }
             }
             break;
         }
@@ -796,15 +800,9 @@ static void output_callback(void *opaque, int avail)
         if (written < len) {
             if (s->stats_enabled) {
                 s->stats_partial_writes++;
-                s->stats_backend_short_bytes += len - written;
+                s->stats_voice_input_unconsumed_bytes += len - written;
             }
             break;
-        }
-    }
-    if (s->stats_enabled) {
-        s->stats_unfilled_bytes += avail;
-        if (avail > 0) {
-            s->stats_unfilled_callbacks++;
         }
     }
     usb_audio_stats_report(s, now_ns);
