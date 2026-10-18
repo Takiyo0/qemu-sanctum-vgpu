@@ -664,6 +664,22 @@ void whpx_set_registers(CPUState *cpu, WHPXStateLevel level)
         apic_base.Reg64 = cpu_get_apic_base(X86_CPU(cpu)->apic_state);
         whpx_set_reg(cpu, WHvX64RegisterApicBase, apic_base);
     }
+
+    /*
+     * Local experiment: with the APIC in the hypervisor, Hyper-V, not QEMU's
+     * cpu->halted, decides whether a vCPU runs. A new partition starts the
+     * APs waiting for a SIPI, but a reset left them running: after a guest
+     * restart or an S3 wake every vCPU ran the firmware's reset vector at
+     * once and each one died there (WHPX-UNRECOVERABLE). On a reset, an AP
+     * waits for its SIPI again (StartupSuspend) and the BSP runs.
+     */
+    if (level == WHPX_LEVEL_RESET_STATE && whpx_irqchip_in_kernel()) {
+        WHV_REGISTER_VALUE activity = {};
+        activity.InternalActivity.StartupSuspend =
+            !cpu_is_bsp(X86_CPU(cpu));
+        activity.InternalActivity.HaltSuspend = 0;
+        whpx_set_reg(cpu, WHvRegisterInternalActivityState, activity);
+    }
 }
 
 static int whpx_get_tsc(CPUState *cpu)
@@ -1026,11 +1042,212 @@ static int emulate_msr_instruction(CPUState *cpu,
     return 0;
 }
 
+/*
+ * Fast path for the common MMIO forms: a 32/64-bit `mov` between a general register and memory
+ * (8B /r, 89 /r) and a store of an immediate (C7 /0), in 64-bit code, with at most a REX prefix.
+ * Only the one register and RIP cross the hypervisor boundary, instead of the full register
+ * state (and the XSAVE area) the instruction emulator reads and writes back for every access.
+ * Anything else, or a vCPU whose QEMU-side state is dirty, takes the emulator.
+ * QEMU_WHPX_MMIO_FAST=0 turns it off.
+ */
+static bool whpx_mmio_fast(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
+{
+    static int enabled = -1;
+    WHV_MEMORY_ACCESS_CONTEXT *ctx = &exit_ctx->MemoryAccess;
+    const uint8_t *b = ctx->InstructionBytes;
+    unsigned n = ctx->InstructionByteCount;
+    unsigned len = exit_ctx->VpContext.InstructionLength;
+    unsigned i = 0;
+    uint8_t rex = 0, op, modrm;
+    unsigned size;
+    bool write;
+    int reg;
+    WHV_REGISTER_NAME names[2];
+    WHV_REGISTER_VALUE vals[2];
+    uint64_t v = 0;
+    HRESULT hr;
+    struct whpx_state *whpx = &whpx_global;
+
+    if (enabled < 0) {
+        const char *e = getenv("QEMU_WHPX_MMIO_FAST");
+        enabled = !(e && e[0] == '0');
+    }
+    if (!enabled || cpu->vcpu_dirty || !exit_ctx->VpContext.Cs.Long) {
+        return false;
+    }
+    if (len == 0 || len > n || len > 15) {
+        return false;
+    }
+    if ((b[i] & 0xF0) == 0x40) {
+        rex = b[i++];
+    }
+    if (i + 1 >= len) {
+        return false;
+    }
+    op = b[i++];
+    modrm = b[i];
+    if ((modrm >> 6) == 3) {
+        return false;
+    }
+    size = (rex & 8) ? 8 : 4;
+    reg = ((modrm >> 3) & 7) | ((rex & 4) ? 8 : 0);
+    switch (op) {
+    case 0x8B:
+        write = false;
+        break;
+    case 0x89:
+        write = true;
+        break;
+    case 0xC7:
+        if (((modrm >> 3) & 7) != 0 || len < 4) {
+            return false;
+        }
+        write = true;
+        reg = -1;
+        break;
+    default:
+        return false;
+    }
+    if (write != (ctx->AccessInfo.AccessType == WHvMemoryAccessWrite)) {
+        return false;
+    }
+    names[1] = WHvX64RegisterRip;
+    vals[1].Reg64 = exit_ctx->VpContext.Rip + len;
+    if (write) {
+        if (reg >= 0) {
+            names[0] = (WHV_REGISTER_NAME)(WHvX64RegisterRax + reg);
+            hr = whp_dispatch.WHvGetVirtualProcessorRegisters(
+                whpx->partition, cpu->cpu_index, &names[0], 1, &vals[0]);
+            if (FAILED(hr)) {
+                return false;
+            }
+            v = vals[0].Reg64;
+        } else {
+            int32_t imm;
+            memcpy(&imm, b + len - 4, 4);
+            v = (uint64_t)(int64_t)imm;
+        }
+        address_space_write(&address_space_memory, ctx->Gpa,
+                            MEMTXATTRS_UNSPECIFIED, &v, size);
+        hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
+            whpx->partition, cpu->cpu_index, &names[1], 1, &vals[1]);
+    } else {
+        address_space_read(&address_space_memory, ctx->Gpa,
+                           MEMTXATTRS_UNSPECIFIED, &v, size);
+        /* A 32-bit load zero-extends into the 64-bit register. */
+        names[0] = (WHV_REGISTER_NAME)(WHvX64RegisterRax + reg);
+        vals[0].Reg64 = v;
+        hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
+            whpx->partition, cpu->cpu_index, names, 2, vals);
+    }
+    if (FAILED(hr)) {
+        error_report("WHPX: MMIO fast path register update failed, hr=%08lx", hr);
+        return false;
+    }
+    return true;
+}
+
 static int whpx_handle_mmio(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
 {
     WHV_MEMORY_ACCESS_CONTEXT *ctx = &exit_ctx->MemoryAccess;
     int ret;
 
+    /*
+     * Classify the memory-access exit before blindly emulating it as MMIO.
+     *
+     * WHPX raises WHvRunVpExitReasonMemoryAccess for two very different cases:
+     *   (a) GpaUnmapped == 1: the guest touched a GPA with no backing mapping.
+     *       This is a genuine device-MMIO access (or truly unbacked), and
+     *       instruction emulation against the QEMU memory model is correct.
+     *   (b) GpaUnmapped == 0: the GPA *is* mapped as RAM, but the access
+     *       violated the permissions WHPX established for that mapping (e.g. a
+     *       write to a read-only / copy-on-write page). This is a protection
+     *       fault that belongs to the GUEST's own page-fault handler, NOT MMIO.
+     *
+     * The upstream code emulated (b) as MMIO, which silently produces a wrong
+     * result for RAM addresses. XNU's dyld shared-region setup relies on taking
+     * such protection faults and resolving them itself (shared submap / COW);
+     * emulating-as-MMIO is what makes vm_shared_region_start_address() return
+     * 0x1 and launchd fail to map libSystem. Reflect the fault to the guest
+     * instead so XNU's VM fault path runs.
+     */
+    if (!ctx->AccessInfo.GpaUnmapped) {
+        X86CPU *x86_cpu = X86_CPU(cpu);
+        CPUX86State *env = &x86_cpu->env;
+        uint64_t error_code;
+        hwaddr xlat = 0, plen = 1;
+        MemoryRegion *mr;
+        bool gpa_is_ram;
+
+        /*
+         * GpaUnmapped==0 is necessary but NOT sufficient to call this a RAM
+         * protection fault: a registered DEVICE/MMIO region also reports
+         * GpaUnmapped==0. OVMF firmware performs plenty of such MMIO accesses
+         * (VGA, etc.) very early, before any guest #PF handler exists --
+         * injecting a #PF for those wedges the firmware at the TianoCore splash.
+         * So confirm the faulting GPA actually resolves to guest RAM before
+         * reflecting the fault; otherwise fall through to MMIO emulation.
+         */
+        mr = address_space_translate(&address_space_memory, ctx->Gpa,
+                                     &xlat, &plen, false,
+                                     MEMTXATTRS_UNSPECIFIED);
+        gpa_is_ram = mr && memory_region_is_ram(mr);
+
+        /* --- DIAGNOSTIC: log the first 40 RAM-branch faults then go quiet. --- */
+        {
+            static int whpx_pf_diag_count;
+            if (whpx_pf_diag_count < 40) {
+                whpx_pf_diag_count++;
+                error_report("WHPX-PFDIAG #%d: Gpa=0x%016llx Gva=0x%016llx "
+                    "AccessType=%u(0=r,1=w,2=x) GpaUnmapped=%u GvaValid=%u "
+                    "Cpl=%u gpa_is_ram=%d mr=%s ro=%d romd=%d",
+                    whpx_pf_diag_count,
+                    (unsigned long long)ctx->Gpa,
+                    (unsigned long long)ctx->Gva,
+                    (unsigned)ctx->AccessInfo.AccessType,
+                    (unsigned)ctx->AccessInfo.GpaUnmapped,
+                    (unsigned)ctx->AccessInfo.GvaValid,
+                    (unsigned)cpu->accel->exit_ctx.VpContext.ExecutionState.Cpl,
+                    (int)gpa_is_ram,
+                    mr ? memory_region_name(mr) : "(none)",
+                    mr ? (int)mr->readonly : -1,
+                    mr ? (int)mr->rom_device : -1);
+            }
+        }
+
+        if (gpa_is_ram) {
+            /* The faulting page IS present (mapped) -> P bit set. */
+            error_code = PG_ERROR_P_MASK;
+            if (ctx->AccessInfo.AccessType == WHvMemoryAccessWrite) {
+                error_code |= PG_ERROR_W_MASK;
+            }
+            if (ctx->AccessInfo.AccessType == WHvMemoryAccessExecute) {
+                error_code |= PG_ERROR_I_D_MASK;
+            }
+            /* CPL==3 -> user-mode fault (U/S bit). Inlined to avoid a fwd ref. */
+            if (cpu->accel->exit_ctx.VpContext.ExecutionState.Cpl == 3) {
+                error_code |= PG_ERROR_U_MASK;
+            }
+            /* CR2 = faulting linear address, when WHPX gave us a valid GVA. */
+            if (ctx->AccessInfo.GvaValid) {
+                env->cr[2] = ctx->Gva;
+            }
+
+            env->exception_nr = EXCP0E_PAGE;
+            env->exception_injected = 1;
+            env->has_error_code = 1;
+            env->error_code = error_code;
+            env->exception_has_payload = 0;
+            env->exception_is_int = 0;
+            /* Injected on the next whpx_inject_exceptions() before re-entry. */
+            return 0;
+        }
+        /* Not RAM (device/MMIO) -> fall through to emulation below. */
+    }
+
+    if (whpx_mmio_fast(cpu, exit_ctx)) {
+        return 0;
+    }
     ret = emulate_instruction(cpu, ctx->InstructionBytes, ctx->InstructionByteCount);
     if (ret < 0) {
         error_report("failed to emulate mmio");
@@ -2680,8 +2897,45 @@ int whpx_vcpu_run(CPUState *cpu)
 
             ret = 1;
             break;
+        case WHvRunVpExitReasonUnrecoverableException: {
+            /* --- DIAGNOSTIC: dump the VP context at the unrecoverable exit. --- */
+            WHV_VP_EXIT_CONTEXT *vc = &vcpu->exit_ctx.VpContext;
+            error_report("WHPX-UNRECOVERABLE: RIP=0x%016llx CS=0x%04x "
+                "Cpl=%u InstrLen=%u Cr8=%u Rflags=0x%016llx "
+                "intr_pending=%u intr_shadow=%u",
+                (unsigned long long)vc->Rip,
+                (unsigned)vc->Cs.Selector,
+                (unsigned)vc->ExecutionState.Cpl,
+                (unsigned)vc->InstructionLength,
+                (unsigned)vc->Cr8,
+                (unsigned long long)vc->Rflags,
+                (unsigned)vc->ExecutionState.InterruptionPending,
+                (unsigned)vc->ExecutionState.InterruptShadow);
+            /* Pull CR2/CR3 + GPRs via the register read for context. */
+            whpx_get_registers(cpu, WHPX_LEVEL_FULL_STATE);
+            {
+                X86CPU *x86_cpu = X86_CPU(cpu);
+                CPUX86State *env = &x86_cpu->env;
+                error_report("WHPX-UNRECOVERABLE regs: CR2=0x%016llx CR3=0x%016llx "
+                    "RAX=0x%016llx RBX=0x%016llx RCX=0x%016llx RDX=0x%016llx "
+                    "RSI=0x%016llx RDI=0x%016llx RSP=0x%016llx RBP=0x%016llx",
+                    (unsigned long long)env->cr[2],
+                    (unsigned long long)env->cr[3],
+                    (unsigned long long)env->regs[R_EAX],
+                    (unsigned long long)env->regs[R_EBX],
+                    (unsigned long long)env->regs[R_ECX],
+                    (unsigned long long)env->regs[R_EDX],
+                    (unsigned long long)env->regs[R_ESI],
+                    (unsigned long long)env->regs[R_EDI],
+                    (unsigned long long)env->regs[R_ESP],
+                    (unsigned long long)env->regs[R_EBP]);
+            }
+            bql_lock();
+            vm_stop(RUN_STATE_PAUSED);
+            bql_unlock();
+            break;
+        }
         case WHvRunVpExitReasonNone:
-        case WHvRunVpExitReasonUnrecoverableException:
         case WHvRunVpExitReasonInvalidVpRegisterValue:
         case WHvRunVpExitReasonUnsupportedFeature:
         default:
@@ -3027,6 +3281,93 @@ void whpx_arch_accel_class_init(ObjectClass *oc)
         "Separate security domain");
 }
 
+/*
+ * Local experiment: opt the whole process out of Windows power throttling
+ * (EcoQoS), which on battery moves a process Windows deems background onto
+ * efficiency cores at low clocks, and coarsens its timers. vCPU threads and
+ * the display's copy threads then run at full speed on battery too.
+ */
+static void whpx_opt_out_of_power_throttling(void)
+{
+    PROCESS_POWER_THROTTLING_STATE state = {0};
+
+    state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED |
+                        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+    state.StateMask = 0;
+    if (!SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling,
+                               &state, sizeof(state))) {
+        warn_report("WHPX: power throttling opt-out failed: %lu",
+                    GetLastError());
+    }
+}
+
+/*
+ * Local experiment: QEMU_PCORES=1 restricts the process (vCPU threads and the
+ * display library's threads alike) to the CPU sets of the highest efficiency
+ * class: the P-cores of a hybrid CPU, so no frame-critical thread lands on an
+ * E-core.
+ */
+static void whpx_restrict_to_pcores(void)
+{
+    const char *on = getenv("QEMU_PCORES");
+    ULONG len = 0;
+    SYSTEM_CPU_SET_INFORMATION *info;
+    BYTE top = 0;
+    ULONG ids[256];
+    ULONG n = 0;
+    BYTE *p, *end;
+
+    typedef BOOL (WINAPI *GetInfoFn)(SYSTEM_CPU_SET_INFORMATION *, ULONG,
+                                     PULONG, HANDLE, ULONG);
+    typedef BOOL (WINAPI *SetDefaultFn)(HANDLE, const ULONG *, ULONG);
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    GetInfoFn get_info;
+    SetDefaultFn set_default;
+
+    if (!on || strcmp(on, "1") != 0) {
+        return;
+    }
+    /* Not declared below _WIN32_WINNT 0x0A00, which QEMU builds under. */
+    get_info = (GetInfoFn)GetProcAddress(k32, "GetSystemCpuSetInformation");
+    set_default = (SetDefaultFn)GetProcAddress(k32, "SetProcessDefaultCpuSets");
+    if (!get_info || !set_default) {
+        warn_report("WHPX: no CPU set API");
+        return;
+    }
+    get_info(NULL, 0, &len, GetCurrentProcess(), 0);
+    info = g_malloc(len);
+    if (!get_info(info, len, &len, GetCurrentProcess(), 0)) {
+        warn_report("WHPX: GetSystemCpuSetInformation failed: %lu",
+                    GetLastError());
+        g_free(info);
+        return;
+    }
+    end = (BYTE *)info + len;
+    for (p = (BYTE *)info; p < end;
+         p += ((SYSTEM_CPU_SET_INFORMATION *)p)->Size) {
+        SYSTEM_CPU_SET_INFORMATION *e = (SYSTEM_CPU_SET_INFORMATION *)p;
+        if (e->Type == CpuSetInformation && e->CpuSet.EfficiencyClass > top) {
+            top = e->CpuSet.EfficiencyClass;
+        }
+    }
+    for (p = (BYTE *)info; p < end && n < G_N_ELEMENTS(ids);
+         p += ((SYSTEM_CPU_SET_INFORMATION *)p)->Size) {
+        SYSTEM_CPU_SET_INFORMATION *e = (SYSTEM_CPU_SET_INFORMATION *)p;
+        if (e->Type == CpuSetInformation && e->CpuSet.EfficiencyClass == top) {
+            ids[n++] = e->CpuSet.Id;
+        }
+    }
+    g_free(info);
+    if (!set_default(GetCurrentProcess(), ids, n)) {
+        warn_report("WHPX: SetProcessDefaultCpuSets failed: %lu",
+                    GetLastError());
+        return;
+    }
+    warn_report("WHPX: restricted to %lu CPU sets of efficiency class %u",
+                n, top);
+}
+
 int whpx_accel_init(AccelState *as, MachineState *ms)
 {
     struct whpx_state *whpx;
@@ -3039,13 +3380,16 @@ int whpx_accel_init(AccelState *as, MachineState *ms)
     WHV_PROCESSOR_FEATURES_BANKS processor_features;
     WHV_PROCESSOR_PERFMON_FEATURES perfmon_features;
 
-    UINT32 cpuidExitList[] = {0x0, 0x1, 0x6, 0x7, 0xb, 0xd, 0x14, 0x24, 0x29, 0x1E,
+    UINT32 cpuidExitList[] = {0x0, 0x1, 0x4, 0x6, 0x7, 0xb, 0xd, 0x14, 0x24, 0x29, 0x1E,
         0x40000000, 0x40000001, 0x40000010, 0x80000000, 0x80000001,
         0x80000002, 0x80000003, 0x80000004, 0x80000007, 0x80000008,
         0x8000000A, 0x80000021, 0x80000022, 0xC0000000, 0xC0000001};
 
     X86MachineState *x86ms = X86_MACHINE(ms);
     bool pic_enabled = false;
+
+    whpx_opt_out_of_power_throttling();
+    whpx_restrict_to_pcores();
 
     if (x86ms->pic == ON_OFF_AUTO_ON || x86ms->pic == ON_OFF_AUTO_AUTO) {
         pic_enabled = true;

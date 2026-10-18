@@ -36,7 +36,9 @@
 #include "migration/vmstate.h"
 #include "desc.h"
 #include "qemu/audio.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
+#include "trace.h"
 
 static void usb_audio_reinit(USBDevice *dev, unsigned channels);
 
@@ -651,32 +653,159 @@ struct USBAudioState {
     uint32_t debug;
     uint32_t buffer_user, buffer;
     bool multi;
+    bool stats_enabled;
+    int64_t stats_last_report_ns;
+    int64_t stats_last_callback_ns;
+    uint64_t stats_packets;
+    uint64_t stats_drop_full;
+    uint64_t stats_bad_size;
+    uint64_t stats_callbacks;
+    uint64_t stats_empty_callbacks;
+    uint64_t stats_partial_writes;
+    uint64_t stats_callback_gaps_over_15ms;
+    uint64_t stats_max_callback_gap_ns;
+    uint64_t stats_output_bytes;
+    uint64_t stats_requested_bytes;
+    uint64_t stats_unfilled_bytes;
+    uint64_t stats_unfilled_callbacks;
+    uint64_t stats_queue_empty_bytes;
+    uint64_t stats_voice_input_unconsumed_bytes;
+    uint32_t stats_queue_highwater_packets;
+    uint32_t stats_queue_lowwater_packets;
+    bool stats_queue_lowwater_valid;
 };
 
 #define TYPE_USB_AUDIO "usb-audio"
 OBJECT_DECLARE_SIMPLE_TYPE(USBAudioState, USB_AUDIO)
 
+static void usb_audio_stats_report(USBAudioState *s, int64_t now_ns)
+{
+    uint32_t packet_size;
+
+    if (!s->stats_enabled) {
+        return;
+    }
+    if (!s->stats_last_report_ns) {
+        s->stats_last_report_ns = now_ns;
+        return;
+    }
+    if (now_ns - s->stats_last_report_ns < 1000000000LL) {
+        return;
+    }
+
+    packet_size = USBAUDIO_PACKET_SIZE(s->out.channels);
+    trace_usb_audio_stats(s->stats_packets, s->stats_drop_full,
+                          s->stats_bad_size, s->stats_callbacks,
+                          s->stats_empty_callbacks, s->stats_partial_writes,
+                          s->stats_callback_gaps_over_15ms,
+                          s->stats_max_callback_gap_ns / 1000000,
+                          s->stats_output_bytes);
+    trace_usb_audio_stats_fill(s->stats_requested_bytes,
+                               s->stats_output_bytes,
+                               s->stats_unfilled_bytes,
+                               s->stats_unfilled_callbacks,
+                               s->stats_queue_empty_bytes,
+                               s->stats_voice_input_unconsumed_bytes);
+    trace_usb_audio_stats_queue(s->stats_queue_highwater_packets,
+                                s->stats_queue_lowwater_valid ?
+                                s->stats_queue_lowwater_packets : 0,
+                                packet_size ? s->out.buf.size / packet_size : 0,
+                                s->out.channels, USBAUDIO_SAMPLE_RATE);
+
+    s->stats_last_report_ns = now_ns;
+    s->stats_packets = 0;
+    s->stats_drop_full = 0;
+    s->stats_bad_size = 0;
+    s->stats_callbacks = 0;
+    s->stats_empty_callbacks = 0;
+    s->stats_partial_writes = 0;
+    s->stats_callback_gaps_over_15ms = 0;
+    s->stats_max_callback_gap_ns = 0;
+    s->stats_output_bytes = 0;
+    s->stats_requested_bytes = 0;
+    s->stats_unfilled_bytes = 0;
+    s->stats_unfilled_callbacks = 0;
+    s->stats_queue_empty_bytes = 0;
+    s->stats_voice_input_unconsumed_bytes = 0;
+    s->stats_queue_highwater_packets = 0;
+    s->stats_queue_lowwater_packets = 0;
+    s->stats_queue_lowwater_valid = false;
+}
+
+static void usb_audio_stats_note_queue_lowwater(USBAudioState *s)
+{
+    uint32_t packet_size = USBAUDIO_PACKET_SIZE(s->out.channels);
+    int64_t used = s->out.buf.prod - s->out.buf.cons;
+    uint32_t used_packets;
+
+    if (!s->stats_enabled || !packet_size) {
+        return;
+    }
+
+    used_packets = used > 0 ? used / packet_size : 0;
+    if (!s->stats_queue_lowwater_valid ||
+        used_packets < s->stats_queue_lowwater_packets) {
+        s->stats_queue_lowwater_packets = used_packets;
+        s->stats_queue_lowwater_valid = true;
+    }
+}
+
 static void output_callback(void *opaque, int avail)
 {
     USBAudioState *s = opaque;
     uint8_t *data;
+    int64_t now_ns = s->stats_enabled ? qemu_clock_get_ns(QEMU_CLOCK_HOST) : 0;
+    int requested = avail;
 
-    while (avail) {
+    if (s->stats_enabled) {
+        if (s->stats_last_callback_ns) {
+            uint64_t gap_ns = now_ns - s->stats_last_callback_ns;
+
+            s->stats_max_callback_gap_ns = MAX(
+                s->stats_max_callback_gap_ns, gap_ns);
+            if (gap_ns > 15000000) {
+                s->stats_callback_gaps_over_15ms++;
+            }
+        }
+        s->stats_last_callback_ns = now_ns;
+        s->stats_callbacks++;
+        s->stats_requested_bytes += requested;
+        usb_audio_stats_note_queue_lowwater(s);
+    }
+
+    while (avail > 0) {
         size_t written, len;
 
         data = streambuf_get(&s->out.buf, &len);
         if (!data) {
-            return;
+            if (s->stats_enabled) {
+                s->stats_empty_callbacks++;
+                if (avail > 0) {
+                    s->stats_unfilled_bytes += avail;
+                    s->stats_unfilled_callbacks++;
+                    s->stats_queue_empty_bytes += avail;
+                }
+            }
+            break;
         }
 
         written = audio_be_write(s->audio_be, s->out.voice, data, len);
         avail -= written;
         s->out.buf.cons += written;
+        if (s->stats_enabled) {
+            s->stats_output_bytes += written;
+            usb_audio_stats_note_queue_lowwater(s);
+        }
 
         if (written < len) {
-            return;
+            if (s->stats_enabled) {
+                s->stats_partial_writes++;
+                s->stats_voice_input_unconsumed_bytes += len - written;
+            }
+            break;
         }
     }
+    usb_audio_stats_report(s, now_ns);
 }
 
 static int usb_audio_set_output_altset(USBAudioState *s, int altset)
@@ -893,12 +1022,34 @@ static void usb_audio_handle_reset(USBDevice *dev)
 
 static void usb_audio_handle_dataout(USBAudioState *s, USBPacket *p)
 {
+    int written;
+
     if (s->out.altset == ALTSET_OFF) {
         p->status = USB_RET_STALL;
         return;
     }
 
-    streambuf_put(&s->out.buf, p, s->out.channels);
+    written = streambuf_put(&s->out.buf, p, s->out.channels);
+    if (s->stats_enabled) {
+        uint32_t packet_size = USBAUDIO_PACKET_SIZE(s->out.channels);
+        uint64_t used = s->out.buf.prod - s->out.buf.cons;
+
+        s->stats_packets++;
+        if (!written) {
+            if (used > s->out.buf.size ||
+                s->out.buf.size - used < packet_size) {
+                s->stats_drop_full++;
+            } else {
+                s->stats_bad_size++;
+            }
+        }
+        if (packet_size) {
+            s->stats_queue_highwater_packets = MAX(
+                s->stats_queue_highwater_packets,
+                (uint32_t)(used / packet_size));
+        }
+        usb_audio_stats_report(s, qemu_clock_get_ns(QEMU_CLOCK_HOST));
+    }
     if (p->actual_length < p->iov.size && s->debug > 1) {
         fprintf(stderr, "usb-audio: output overrun (%zd bytes)\n",
                 p->iov.size - p->actual_length);
@@ -950,6 +1101,7 @@ static void usb_audio_realize(USBDevice *dev, Error **errp)
     usb_desc_create_serial(dev);
     usb_desc_init(dev);
     s->dev.opaque = s;
+    s->stats_enabled = g_strcmp0(g_getenv("QEMU_AUDIO_STATS"), "1") == 0;
 
     s->out.altset        = ALTSET_OFF;
     s->out.vol.mute      = false;

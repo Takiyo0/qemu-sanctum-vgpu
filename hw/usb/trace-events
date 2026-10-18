@@ -393,3 +393,14 @@ aspeed_udc_handle_data(int ep_nr, const char *dir, uint32_t iov, int ep_idx) "ep
 aspeed_udc_ep_data_in(unsigned ep, uint32_t rptr, uint32_t wptr, uint32_t iov) "ep %u, rptr %u, wptr %u, iov %u"
 aspeed_udc_ep_data_out(unsigned ep, uint32_t wptr, uint32_t avail, uint32_t iov) "ep %u, wptr %u, avail %u, iov %u"
 aspeed_udc_ep_ack(unsigned ep) "ep %u"
+
+# dev-vmapple-tablet.c
+usb_vmapple_tablet_report(uint8_t buttons, uint16_t x, uint16_t y, int16_t wheel, int16_t pan, int32_t scroll_y, int32_t scroll_x, uint16_t phases) "buttons 0x%x x %u y %u wheel %d pan %d scroll y %d x %d phases 0x%x"
+usb_vmapple_tablet_queue_full(void) "queue full"
+usb_vmapple_tablet_get_report(uint8_t type, uint8_t id) "type %u id %u"
+usb_vmapple_tablet_set_report(uint8_t id, uint8_t value) "feature %u value %u"
+
+# dev-audio.c
+usb_audio_stats(uint64_t packets, uint64_t drop_full, uint64_t bad_size, uint64_t callbacks, uint64_t empty_callbacks, uint64_t partial_writes, uint64_t gaps_over_15ms, uint64_t max_gap_ms, uint64_t output_bytes) "packets=%" PRIu64 " drop_full=%" PRIu64 " bad_size=%" PRIu64 " callbacks=%" PRIu64 " empty_callbacks=%" PRIu64 " partial_writes=%" PRIu64 " gaps_gt_15ms=%" PRIu64 " max_gap_ms=%" PRIu64 " output_bytes=%" PRIu64
+usb_audio_stats_fill(uint64_t requested_bytes, uint64_t written_bytes, uint64_t unfilled_bytes, uint64_t unfilled_callbacks, uint64_t queue_empty_bytes, uint64_t voice_input_unconsumed_bytes) "requested_bytes=%" PRIu64 " written_bytes=%" PRIu64 " unfilled_bytes=%" PRIu64 " unfilled_callbacks=%" PRIu64 " queue_empty_bytes=%" PRIu64 " voice_input_unconsumed_bytes=%" PRIu64
+usb_audio_stats_queue(uint32_t highwater_packets, uint32_t lowwater_packets, uint32_t capacity_packets, uint32_t channels, uint32_t rate) "queue_highwater_packets=%u queue_lowwater_packets=%u queue_capacity_packets=%u channels=%u rate=%u"

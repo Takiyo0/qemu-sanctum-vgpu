@@ -295,6 +295,16 @@ static int usb_host_init(void)
     if (rc != 0) {
         return -1;
     }
+#ifdef CONFIG_WIN32
+    /*
+     * UsbDk detaches a device from its Windows driver while QEMU holds it and
+     * gives it back on release, so no per-device WinUSB driver swap is needed.
+     * Without UsbDk installed this fails and libusb stays on WinUSB.
+     */
+    if (libusb_set_option(ctx, LIBUSB_OPTION_USE_USBDK) != LIBUSB_SUCCESS) {
+        warn_report("usb-host: UsbDk not available, using WinUSB-bound devices only");
+    }
+#endif
 #if LIBUSB_API_VERSION >= 0x01000106
     libusb_set_option(ctx, LIBUSB_OPTION_LOG_LEVEL, loglevel);
 #else

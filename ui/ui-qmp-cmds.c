@@ -14,6 +14,8 @@
  */
 
 #include "qemu/osdep.h"
+#include "qom/object.h"
+#include "qapi/error.h"
 
 #include "io/channel-file.h"
 #include "monitor/qmp-helpers.h"
@@ -388,3 +390,42 @@ qmp_screendump(const char *filename, const char *device,
     }
 }
 #endif /* CONFIG_PIXMAN */
+
+static Object *reims_gpu(const char *device, Error **errp)
+{
+    g_autofree char *path = g_strdup_printf("/machine/peripheral/%s", device);
+    Object *obj = object_resolve_path(path, NULL);
+    if (!obj || (!object_dynamic_cast(obj, "apple-gfx-pci") &&
+                 !object_dynamic_cast(obj, "apple-gfx-mmio"))) {
+        error_setg(errp, "No Reims GPU with device ID '%s'", device);
+        return NULL;
+    }
+    return obj;
+}
+
+ReimsDisplayState *qmp_query_reims_displays(const char *device, Error **errp)
+{
+    Object *obj = reims_gpu(device, errp);
+    ReimsDisplayState *state;
+    if (!obj) {
+        return NULL;
+    }
+    state = g_new0(ReimsDisplayState, 1);
+    state->device = g_strdup(device);
+    state->count = object_property_get_uint(obj, "display-count", &error_abort);
+    state->ports = object_property_get_uint(obj, "display-ports", &error_abort);
+    if (!state->ports) {
+        state->ports = state->count;
+    }
+    return state;
+}
+
+ReimsDisplayState *qmp_reims_set_display_count(const char *device,
+                                               uint32_t count, Error **errp)
+{
+    Object *obj = reims_gpu(device, errp);
+    if (!obj || !object_property_set_uint(obj, "display-count", count, errp)) {
+        return NULL;
+    }
+    return qmp_query_reims_displays(device, errp);
+}
