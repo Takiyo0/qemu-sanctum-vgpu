@@ -171,7 +171,7 @@ static void apple_gfx_pci_realize(PCIDevice *dev, Error **errp)
     pci_register_bar(dev, RVG_PCI_BAR_MMIO,
                      PCI_BASE_ADDRESS_SPACE_MEMORY, &s->common.iomem_gfx);
     /* A second KVM slot onto a guest_memfd's RAM would be refused */
-    if (s->efi_fb_bar && ram && !memory_region_has_guest_memfd(ram)) {
+    if (s->efi_fb_bar && ram && !memory_region_has_guest_memfd_private(ram)) {
         memory_region_init(&s->efi_fb_bar_mr, OBJECT(dev),
                            "apple-gfx-pci.efi-fb-bar",
                            APPLE_GFX_PCI_EFI_FB_BAR_SIZE);
